@@ -1,0 +1,58 @@
+﻿[package]
+name = "pool-mod"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.75"
+readme = "README.md"
+license = "Apache-2.0 OR MIT"
+
+authors = [
+    "James Gober <me@jamesgober.com>"
+]
+
+description = "Generic object and connection pooling. Async-safe with min/max sizing, idle timeouts, max-lifetime enforcement, validation-on-borrow, and health-check callbacks. Works for database connections, HTTP clients, worker threads, or any expensive resource."
+
+keywords = [
+    "pool",
+    "connection-pool",
+    "object-pool",
+    "resource",
+    "rust"
+]
+
+categories = [
+    "asynchronous",
+    "rust-patterns"
+]
+
+documentation = "https://docs.rs/pool-mod"
+repository    = "https://github.com/jamesgober/pool-mod"
+homepage      = "https://github.com/jamesgober/pool-mod"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[lib]
+name = "pool_mod"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = true
