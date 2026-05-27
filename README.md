@@ -13,15 +13,7 @@
 
 <p align="center">Async-safe min/max sizing, idle timeouts, max-lifetime enforcement, validation-on-borrow, health-check callbacks. Runtime-agnostic.</p>
 
----
 
-## Status
-
-**Active development.** Scaffolded and on the path to 1.0. See [.dev/ROADMAP.md](.dev/ROADMAP.md) for milestone tracking.
-
-The public API is not yet stable. Pin specific versions; expect changes pre-1.0.
-
----
 
 ## What it does
 
@@ -42,7 +34,7 @@ pool-mod = "0.1"
 
 - **REPS** governs every decision. See [REPS.md](REPS.md).
 - **MSRV:** Rust 1.75.
-- **Edition:** 2024.
+- **Edition:** 2021.
 - **Cross-platform:** Linux, macOS, Windows.
 
 ---

@@ -1,4 +1,4 @@
-﻿//! # pool-mod
+//! # pool-mod
 //!
 //! GENERIC OBJECT AND CONNECTION POOLING
 //!
@@ -27,6 +27,7 @@
 #![deny(clippy::print_stdout)]
 #![deny(clippy::print_stderr)]
 #![deny(clippy::dbg_macro)]
+#![deny(clippy::unreachable)]
 #![deny(clippy::undocumented_unsafe_blocks)]
 #![deny(clippy::missing_safety_doc)]
 
