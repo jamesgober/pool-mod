@@ -19,6 +19,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-05-27
+
+### Added
+
+- `Manager` trait — the resource lifecycle contract: `create`, `recycle`, and an
+  optional `validate` health check for validation-on-borrow.
+- `Pool<M>` — the thread-safe, cheaply-cloneable pool: `builder`, `new`, `get`,
+  `get_timeout`, `status`, `close`, and `is_closed`.
+- `Builder<M>` — fluent configuration reached through `Pool::builder`, validated
+  on `build`, which pre-creates the `min_idle` resources.
+- `PoolConfig` — `max_size`, `min_idle`, `create_timeout`, `idle_timeout`, and
+  `max_lifetime`, with documented defaults.
+- `Pooled<M>` — the RAII guard that recycles and returns its resource on drop;
+  deref-coerces to the resource and is `Send`.
+- `Status` — a snapshot of `size`, `idle`, `in_use`, and `max_size`.
+- `Error<E>` — `Backend`, `Timeout`, `Closed`, and `InvalidConfig`, generic over
+  the manager's own error type, with `Display` and `std::error::Error` impls.
+- `prelude` module re-exporting the full public surface.
+- Unit tests for every lifecycle path, an end-to-end integration test exercising
+  the pool across eight threads, and rustdoc examples on every public item.
+
+### Changed
+
+- Crate root now lays out the module structure (`config`, `error`, `manager`,
+  `object`, `pool`, `status`) and re-exports the public types. The pool is gated
+  behind the default `std` feature; without it the crate exposes only `VERSION`.
+
+---
+
 ## [0.1.0] - 2026-05-27
 
 ### Added
@@ -41,5 +70,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stripped the UTF-8 BOM and added trailing newlines to the source files to
   satisfy `rustfmt`.
 
-[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jamesgober/pool-mod/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/pool-mod/releases/tag/v0.1.0
