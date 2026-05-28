@@ -50,7 +50,7 @@
 
 ```toml
 [dependencies]
-pool-mod = "0.9"
+pool-mod = "1.0"
 ```
 
 MSRV is Rust 1.75. The crate is edition 2021 and builds on Linux, macOS, and Windows.
@@ -179,6 +179,31 @@ For the complete reference — every public item, its parameters, return values,
 
 <br>
 
+## Performance
+
+The hot path is borrow-and-return against an available resource. The pool guards
+only a small queue and a few counters under a mutex; resource construction,
+validation, and recycling all run outside the lock, and an uncontended
+check-in/return touches the condition variable only when a thread is actually
+waiting.
+
+Latest local Criterion means (`cargo bench`, Windows x86_64, Rust stable,
+single-threaded, trivial resource):
+
+| Benchmark              | Time/op |
+|------------------------|--------:|
+| `get` + return (reuse) | ~98 ns  |
+| `try_get` + return     | ~97 ns  |
+| `status` snapshot      | ~8.5 ns |
+
+These measure the pool machinery itself with a no-op resource; in real use the
+checkout cost is dominated by the work the resource does (a query, a request),
+which the pool exists to amortize. The steady-state checkout/return path performs
+no heap allocation. Numbers vary by CPU and platform — run `cargo bench` on your
+target for figures that matter to you.
+
+<br>
+
 ## Cross-Platform Support
 
 - Linux (x86_64, aarch64)
@@ -211,14 +236,14 @@ cargo fmt --all -- --check
 
 <br>
 
-## Roadmap
+## Stability
 
-`pool-mod` is fast-tracking to a stable 1.0. Property tests and hot-path
-benchmarks landed in v0.5.0; the opt-in background reaper and the pre-1.0
-hardening audit (zero-dependency, `cargo audit` / `cargo deny` clean, full
-cross-platform matrix on stable and MSRV) landed in v0.9.0. Remaining before 1.0:
-tracked benchmark baselines and the final API freeze. See
-[`.dev/ROADMAP.md`](./.dev/ROADMAP.md).
+**`1.0.0` is the API freeze.** Every public item is stable under semantic
+versioning: nothing is removed, renamed, or changed in a breaking way within the
+`1.x` series. New functionality is additive, and `Error` is `#[non_exhaustive]`
+so it can grow without breaking matches. The MSRV (Rust 1.75) will not rise in a
+patch release. See [`docs/API.md`](./docs/API.md#compatibility) for the full
+promise and [`CHANGELOG.md`](./CHANGELOG.md) for the history.
 
 <br>
 <hr>

@@ -35,6 +35,10 @@ struct State<R> {
     idle: VecDeque<Idle<R>>,
     /// Resources the pool currently owns: idle, checked out, or mid-creation.
     total: usize,
+    /// Threads currently blocked in [`PoolInner::acquire`] waiting on `available`.
+    /// Maintained under the lock so the wakers can skip the condvar entirely when
+    /// no one is waiting — the common, uncontended case.
+    waiters: usize,
     closed: bool,
 }
 
@@ -115,23 +119,30 @@ impl<M: Manager> PoolInner<M> {
                         break Action::Create;
                     }
                     // Saturated: wait for a check-in or a close, then re-evaluate.
+                    // `waiters` is bumped immediately before sleeping and dropped
+                    // the moment we wake, both under the lock, so a waker can tell
+                    // whether a signal is needed at all.
                     match deadline {
                         None => {
+                            state.waiters += 1;
                             state = self
                                 .available
                                 .wait(state)
                                 .unwrap_or_else(PoisonError::into_inner);
+                            state.waiters -= 1;
                         }
                         Some(dl) => {
                             let now = Instant::now();
                             if now >= dl {
                                 return Err(Error::Timeout);
                             }
+                            state.waiters += 1;
                             let (guard, _) = self
                                 .available
                                 .wait_timeout(state, dl - now)
                                 .unwrap_or_else(PoisonError::into_inner);
                             state = guard;
+                            state.waiters -= 1;
                         }
                     }
                 }
@@ -204,6 +215,7 @@ impl<M: Manager> PoolInner<M> {
         }
         let now = Instant::now();
         let mut expired = Vec::new();
+        let waiters;
         {
             let mut state = lock(&self.state);
             if state.closed {
@@ -219,31 +231,31 @@ impl<M: Manager> PoolInner<M> {
             }
             state.total = state.total.saturating_sub(expired.len());
             state.idle = kept;
+            waiters = state.waiters;
         }
-        let freed = expired.len();
         drop(expired); // destructors run here, outside the lock
-        if freed > 0 {
-            // Freed slots may unblock threads waiting to create a resource.
-            self.available.notify_all();
-        }
+                       // Freed slots may unblock threads waiting to create a resource.
+        self.wake_all(waiters);
     }
 
-    /// Give back a reserved slot and wake one waiter so it can claim it.
+    /// Give back a reserved slot and wake one waiter, if any, so it can claim it.
     fn release_slot(&self) {
         let mut state = lock(&self.state);
         state.total = state.total.saturating_sub(1);
+        let waiters = state.waiters;
         drop(state);
-        self.available.notify_one();
+        self.wake_one(waiters);
     }
 
     /// Return a borrowed resource to the pool. Called from [`Pooled`]'s `Drop`.
     pub(crate) fn checkin(&self, mut resource: M::Resource, created_at: Instant) {
         let recycled = self.manager.recycle(&mut resource);
         let mut state = lock(&self.state);
+        let waiters = state.waiters;
         if state.closed || recycled.is_err() {
             state.total = state.total.saturating_sub(1);
             drop(state);
-            self.available.notify_one();
+            self.wake_one(waiters);
             // `resource` is dropped here, outside the lock.
         } else {
             let last_used = Instant::now();
@@ -253,7 +265,27 @@ impl<M: Manager> PoolInner<M> {
                 last_used,
             });
             drop(state);
+            self.wake_one(waiters);
+        }
+    }
+
+    /// Wake a single blocked acquirer, but only if one is actually waiting.
+    ///
+    /// `waiters` is the count read under the lock by the caller; skipping the
+    /// condvar when it is zero keeps the uncontended checkout/return path free of
+    /// needless signaling.
+    #[inline]
+    fn wake_one(&self, waiters: usize) {
+        if waiters > 0 {
             self.available.notify_one();
+        }
+    }
+
+    /// Wake every blocked acquirer, but only if any are waiting.
+    #[inline]
+    fn wake_all(&self, waiters: usize) {
+        if waiters > 0 {
+            self.available.notify_all();
         }
     }
 }
@@ -548,8 +580,9 @@ impl<M: Manager> Pool<M> {
         let drained = std::mem::take(&mut state.idle);
         state.total = state.total.saturating_sub(drained.len());
         state.closed = true;
+        let waiters = state.waiters;
         drop(state);
-        self.0.available.notify_all();
+        self.0.wake_all(waiters); // wake blocked acquirers so they observe the close
         self.0.shutdown.signal(); // stop the reaper; a closed pool needs no upkeep
         drop(drained); // resource destructors run here, outside the lock
     }
@@ -690,6 +723,7 @@ impl<M: Manager> Builder<M> {
             state: Mutex::new(State {
                 idle: VecDeque::with_capacity(self.config.max_size),
                 total: 0,
+                waiters: 0,
                 closed: false,
             }),
             available: Condvar::new(),

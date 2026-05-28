@@ -19,6 +19,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.0] - 2026-05-27
+
+First stable release. **The public API is frozen** under semantic versioning; no
+breaking changes will land within the `1.x` series. No new surface since 0.9.0 —
+this release captures benchmark baselines, applies one internal hot-path
+optimization, and freezes the API.
+
+### Changed
+
+- Internal: the acquire path now tracks a waiter count under the lock, so
+  check-in, slot release, reap, and close signal the condition variable only when
+  a thread is actually blocked. The uncontended borrow-and-return path is about
+  8% faster as a result (~106 ns → ~98 ns locally). No observable behavior change.
+
+### Performance
+
+- Captured Criterion baselines (Windows x86_64, stable, single-threaded, trivial
+  resource): `get` + return ≈ 98 ns, `try_get` + return ≈ 97 ns, `status` ≈ 8.5 ns.
+  The steady-state checkout/return path is allocation-free.
+
+---
+
 ## [0.9.0] - 2026-05-27
 
 Feature freeze and the pre-1.0 hardening audit. The final feature — an opt-in
@@ -130,7 +152,8 @@ background reaper — lands here; the rest is audit and verification.
 - Stripped the UTF-8 BOM and added trailing newlines to the source files to
   satisfy `rustfmt`.
 
-[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/pool-mod/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pool-mod/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...v0.5.0
 [0.2.0]: https://github.com/jamesgober/pool-mod/compare/v0.1.0...v0.2.0

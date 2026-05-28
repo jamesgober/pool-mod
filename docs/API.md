@@ -16,7 +16,7 @@
 <br>
 
 `pool-mod` is a generic object and connection pool. This document is the complete
-reference for the public API as of `v0.9.0`: every exported item, what it does,
+reference for the public API as of `v1.0.0`: every exported item, what it does,
 the meaning of each parameter and return value, the error semantics, and runnable
 examples for each use case.
 
@@ -58,7 +58,7 @@ The whole pooling surface lives behind the default `std` feature. With
 
 ```toml
 [dependencies]
-pool-mod = "0.9"
+pool-mod = "1.0"
 ```
 
 The crate is edition 2021 with a Minimum Supported Rust Version of 1.75, and
@@ -788,11 +788,11 @@ pub const VERSION: &str;
 ```
 
 The crate version string, populated from `CARGO_PKG_VERSION` at build time —
-`"0.9.0"` for this release. Available even under `no_std`. Useful in a `--version`
+`"1.0.0"` for this release. Available even under `no_std`. Useful in a `--version`
 banner, a startup log line, or a diagnostics endpoint.
 
 ```rust
-assert_eq!(pool_mod::VERSION, "0.9.0");
+assert_eq!(pool_mod::VERSION, "1.0.0");
 ```
 
 ## Patterns
@@ -935,8 +935,17 @@ the entire pooling API requires the `std` feature. Feature flags are additive.
 
 ## Compatibility
 
-`pool-mod` follows semantic versioning. While the crate is pre-1.0 the public API
-may change between minor versions as the remaining roadmap items land (a
-background idle reaper, a native async API). Every change is recorded in
-[`CHANGELOG.md`](../CHANGELOG.md) and in the per-version notes under
-[`docs/release/`](./release). The `1.0.0` release freezes the API.
+`pool-mod` follows semantic versioning, and **`1.0.0` freezes the public API.**
+Everything documented on this page — the [`Manager`](#manager) trait, [`Pool`](#pool)
+and its methods, [`Builder`](#builder), [`PoolConfig`](#poolconfig) and its fields,
+[`Pooled`](#pooled), [`Status`](#status), [`Error`](#error), the [`prelude`](#prelude),
+and [`VERSION`](#version) — is stable. Within the `1.x` series:
+
+- No item is removed or renamed, and no signature changes in a breaking way.
+- New functionality is additive. `Error` is `#[non_exhaustive]`, so new variants
+  may be added in a minor release; match on it with a wildcard arm.
+- The MSRV (Rust 1.75) will not increase in a patch release; an MSRV bump is at
+  least a minor release and noted in the changelog.
+
+Every change is recorded in [`CHANGELOG.md`](../CHANGELOG.md) and in the
+per-version notes under [`docs/release/`](./release).
