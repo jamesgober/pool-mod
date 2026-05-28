@@ -49,11 +49,21 @@ pub struct PoolConfig {
     /// Discard and replace a resource older than this, regardless of use,
     /// checked the next time it is borrowed. `None` disables lifetime expiry.
     pub max_lifetime: Option<Duration>,
+
+    /// How often a background thread should prune idle resources that have
+    /// outlived `idle_timeout` or `max_lifetime`, rather than waiting for them to
+    /// be rejected on their next checkout. `None` (the default) runs no
+    /// background thread; expiry is then applied lazily, on borrow.
+    ///
+    /// The reaper only prunes — it never creates resources — and has no effect
+    /// unless `idle_timeout` or `max_lifetime` is also set.
+    pub reap_interval: Option<Duration>,
 }
 
 impl Default for PoolConfig {
     /// A pool of up to ten resources, created on demand, that waits up to thirty
-    /// seconds for a free resource and never expires idle or aged resources.
+    /// seconds for a free resource, never expires idle or aged resources, and
+    /// runs no background reaper.
     fn default() -> Self {
         PoolConfig {
             max_size: 10,
@@ -61,6 +71,7 @@ impl Default for PoolConfig {
             create_timeout: Some(Duration::from_secs(30)),
             idle_timeout: None,
             max_lifetime: None,
+            reap_interval: None,
         }
     }
 }

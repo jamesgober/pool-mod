@@ -16,7 +16,7 @@
 <br>
 
 `pool-mod` is a generic object and connection pool. This document is the complete
-reference for the public API as of `v0.5.0`: every exported item, what it does,
+reference for the public API as of `v0.9.0`: every exported item, what it does,
 the meaning of each parameter and return value, the error semantics, and runnable
 examples for each use case.
 
@@ -58,7 +58,7 @@ The whole pooling surface lives behind the default `std` feature. With
 
 ```toml
 [dependencies]
-pool-mod = "0.5"
+pool-mod = "0.9"
 ```
 
 The crate is edition 2021 with a Minimum Supported Rust Version of 1.75, and
@@ -463,6 +463,7 @@ a field of [`PoolConfig`](#poolconfig).
 | `create_timeout`  | `Option<Duration>` | `get` wait bound; `None` waits forever.         |
 | `idle_timeout`    | `Option<Duration>` | Idle-expiry window; `None` disables it.         |
 | `max_lifetime`    | `Option<Duration>` | Lifetime cap; `None` disables it.               |
+| `reap_interval`   | `Option<Duration>` | Background prune cadence; `None` disables the reaper. |
 | `config`          | `PoolConfig`       | Replace the whole configuration at once.        |
 
 `build` validates the configuration and pre-creates the `min_idle` resources:
@@ -527,6 +528,7 @@ pub struct PoolConfig {
     pub create_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub max_lifetime: Option<Duration>,
+    pub reap_interval: Option<Duration>,
 }
 ```
 
@@ -545,8 +547,17 @@ construction.
 | `create_timeout` | `30s`   | `get` wait bound when saturated. `None` waits indefinitely.      |
 | `idle_timeout`   | `None`  | Replace a resource unused this long, checked on next borrow.     |
 | `max_lifetime`   | `None`  | Replace a resource older than this, checked on next borrow.      |
+| `reap_interval`  | `None`  | Background prune cadence; `None` applies expiry lazily on borrow. |
 
 `PoolConfig::default()` returns the values in the table above.
+
+When `reap_interval` is `Some`, the pool spawns a background thread that prunes
+idle resources past `idle_timeout` / `max_lifetime` on that cadence, instead of
+waiting for them to be rejected at their next checkout. The reaper only prunes —
+it never creates resources — and has no effect unless `idle_timeout` or
+`max_lifetime` is also set. It holds a weak reference to the pool and stops when
+the pool is closed or its last handle is dropped. If the OS cannot spawn the
+thread, the pool falls back to lazy, checkout-time expiry.
 
 **Examples**
 
@@ -777,11 +788,11 @@ pub const VERSION: &str;
 ```
 
 The crate version string, populated from `CARGO_PKG_VERSION` at build time —
-`"0.5.0"` for this release. Available even under `no_std`. Useful in a `--version`
+`"0.9.0"` for this release. Available even under `no_std`. Useful in a `--version`
 banner, a startup log line, or a diagnostics endpoint.
 
 ```rust
-assert_eq!(pool_mod::VERSION, "0.5.0");
+assert_eq!(pool_mod::VERSION, "0.9.0");
 ```
 
 ## Patterns

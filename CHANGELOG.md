@@ -19,6 +19,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-05-27
+
+Feature freeze and the pre-1.0 hardening audit. The final feature — an opt-in
+background reaper — lands here; the rest is audit and verification.
+
+### Added
+
+- Opt-in background reaper. A new `PoolConfig::reap_interval` (and
+  `Builder::reap_interval`) spawns a background thread that prunes idle resources
+  past `idle_timeout` / `max_lifetime` rather than waiting for them to be rejected
+  on their next checkout. Disabled by default (`None`), so behavior and overhead
+  are unchanged unless enabled. The reaper holds only a weak reference and stops
+  when the pool is closed or its last handle is dropped.
+- `deny.toml` — a `cargo deny` supply-chain policy (advisories, bans, permissive
+  licenses, trusted sources).
+
+### Changed
+
+- `prepare` (checkout) and the reaper now share a single time-expiry helper, so
+  lazy and eager expiry apply identical `idle_timeout` / `max_lifetime` rules.
+
+### Audit
+
+- Zero runtime dependencies; `cargo audit` reports no advisories across the
+  dev-dependency tree; `cargo deny check` passes (advisories, bans, licenses,
+  sources).
+- No `unwrap` / `expect` / `todo!` / `unimplemented!` / `dbg!` / `print*` in
+  shipping code; the single `#[allow]` (test-module `unwrap`) is justified inline.
+- `Error` is `#[non_exhaustive]`; every variant is documented and tested.
+- Full matrix green on Linux, macOS, and Windows across stable and MSRV 1.75:
+  `fmt`, `clippy --all-targets --all-features -D warnings`, `test --all-features`,
+  and `doc` with `RUSTDOCFLAGS=-D warnings`.
+
+---
+
 ## [0.5.0] - 2026-05-27
 
 ### Added
@@ -95,7 +130,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stripped the UTF-8 BOM and added trailing newlines to the source files to
   satisfy `rustfmt`.
 
-[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jamesgober/pool-mod/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...v0.5.0
 [0.2.0]: https://github.com/jamesgober/pool-mod/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/pool-mod/releases/tag/v0.1.0

@@ -1,7 +1,8 @@
 //! The pool itself: [`Pool`] and its [`Builder`].
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::PoolConfig;
@@ -47,6 +48,33 @@ enum Action<R> {
     Create,
 }
 
+/// The stop signal shared between the pool and its background reaper thread.
+///
+/// Held by both sides through an [`Arc`] so it outlives the [`PoolInner`] it
+/// guards: when the last pool handle drops, `PoolInner`'s destructor sets the
+/// flag and wakes the reaper, which then exits.
+struct Shutdown {
+    stop: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl Shutdown {
+    fn new() -> Self {
+        Shutdown {
+            stop: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Signal the reaper to stop and wake it immediately.
+    fn signal(&self) {
+        let mut stop = lock(&self.stop);
+        *stop = true;
+        drop(stop);
+        self.wake.notify_all();
+    }
+}
+
 /// Shared pool state behind an [`Arc`]. Every [`Pool`] handle and every live
 /// [`Pooled`] guard holds one of these.
 pub(crate) struct PoolInner<M: Manager> {
@@ -54,6 +82,15 @@ pub(crate) struct PoolInner<M: Manager> {
     config: PoolConfig,
     state: Mutex<State<M::Resource>>,
     available: Condvar,
+    shutdown: Arc<Shutdown>,
+}
+
+impl<M: Manager> Drop for PoolInner<M> {
+    fn drop(&mut self) {
+        // The last handle is gone. Stop the reaper (if one is running) so it does
+        // not outlive the pool it maintains.
+        self.shutdown.signal();
+    }
 }
 
 impl<M: Manager> PoolInner<M> {
@@ -126,21 +163,69 @@ impl<M: Manager> PoolInner<M> {
     /// `None` (dropping the resource) when it is too old, has sat idle too long,
     /// or fails validation.
     fn prepare(&self, mut idle: Idle<M::Resource>) -> Option<(M::Resource, Instant)> {
-        let now = Instant::now();
-        if let Some(max_lifetime) = self.config.max_lifetime {
-            if now.saturating_duration_since(idle.created_at) >= max_lifetime {
-                return None;
-            }
-        }
-        if let Some(idle_timeout) = self.config.idle_timeout {
-            if now.saturating_duration_since(idle.last_used) >= idle_timeout {
-                return None;
-            }
+        if self.is_time_expired(&idle, Instant::now()) {
+            return None;
         }
         if !self.manager.validate(&mut idle.resource) {
             return None;
         }
         Some((idle.resource, idle.created_at))
+    }
+
+    /// Whether an idle resource has outlived `max_lifetime` or `idle_timeout`.
+    ///
+    /// This is the time-based half of expiry, shared by checkout
+    /// ([`prepare`](Self::prepare)) and the background [`reap`](Self::reap); it
+    /// deliberately does not call [`Manager::validate`], which is a checkout-time
+    /// concern.
+    fn is_time_expired(&self, idle: &Idle<M::Resource>, now: Instant) -> bool {
+        if let Some(max_lifetime) = self.config.max_lifetime {
+            if now.saturating_duration_since(idle.created_at) >= max_lifetime {
+                return true;
+            }
+        }
+        if let Some(idle_timeout) = self.config.idle_timeout {
+            if now.saturating_duration_since(idle.last_used) >= idle_timeout {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Prune idle resources that have outlived their `idle_timeout` or
+    /// `max_lifetime`. Called on each tick of the background reaper.
+    ///
+    /// Expired resources are removed under the lock but dropped outside it, so a
+    /// slow destructor does not stall checkouts. The reaper never creates
+    /// resources; pruning shrinks the idle set, and on-demand growth refills it.
+    fn reap(&self) {
+        if self.config.idle_timeout.is_none() && self.config.max_lifetime.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        {
+            let mut state = lock(&self.state);
+            if state.closed {
+                return;
+            }
+            let mut kept = VecDeque::with_capacity(state.idle.len());
+            while let Some(idle) = state.idle.pop_front() {
+                if self.is_time_expired(&idle, now) {
+                    expired.push(idle.resource);
+                } else {
+                    kept.push_back(idle);
+                }
+            }
+            state.total = state.total.saturating_sub(expired.len());
+            state.idle = kept;
+        }
+        let freed = expired.len();
+        drop(expired); // destructors run here, outside the lock
+        if freed > 0 {
+            // Freed slots may unblock threads waiting to create a resource.
+            self.available.notify_all();
+        }
     }
 
     /// Give back a reserved slot and wake one waiter so it can claim it.
@@ -169,6 +254,34 @@ impl<M: Manager> PoolInner<M> {
             });
             drop(state);
             self.available.notify_one();
+        }
+    }
+}
+
+/// The body of the background reaper thread.
+///
+/// Sleeps for `interval` between sweeps, waking early when the shutdown signal
+/// fires. It holds only a [`Weak`] reference to the pool, so it never keeps the
+/// pool alive; once every handle is dropped (`upgrade` returns `None`) or the
+/// stop flag is set, it returns and the thread ends.
+fn reaper_loop<M: Manager>(pool: Weak<PoolInner<M>>, shutdown: Arc<Shutdown>, interval: Duration) {
+    loop {
+        {
+            let stop = lock(&shutdown.stop);
+            if *stop {
+                return;
+            }
+            let (stop, _timed_out) = shutdown
+                .wake
+                .wait_timeout(stop, interval)
+                .unwrap_or_else(PoisonError::into_inner);
+            if *stop {
+                return;
+            }
+        }
+        match pool.upgrade() {
+            Some(inner) => inner.reap(),
+            None => return,
         }
     }
 }
@@ -437,6 +550,7 @@ impl<M: Manager> Pool<M> {
         state.closed = true;
         drop(state);
         self.0.available.notify_all();
+        self.0.shutdown.signal(); // stop the reaper; a closed pool needs no upkeep
         drop(drained); // resource destructors run here, outside the lock
     }
 
@@ -520,6 +634,15 @@ impl<M: Manager> Builder<M> {
         self
     }
 
+    /// Set how often a background thread prunes expired idle resources. `None`
+    /// (the default) runs no background thread, applying expiry lazily on borrow.
+    ///
+    /// Has no effect unless `idle_timeout` or `max_lifetime` is also set.
+    pub fn reap_interval(mut self, interval: Option<Duration>) -> Self {
+        self.config.reap_interval = interval;
+        self
+    }
+
     /// Replace the entire configuration with `config`.
     ///
     /// Useful when the configuration is loaded from a file rather than assembled
@@ -570,6 +693,7 @@ impl<M: Manager> Builder<M> {
                 closed: false,
             }),
             available: Condvar::new(),
+            shutdown: Arc::new(Shutdown::new()),
         }));
 
         for _ in 0..pool.0.config.min_idle {
@@ -588,11 +712,42 @@ impl<M: Manager> Builder<M> {
             }
         }
 
+        pool.spawn_reaper();
+
         Ok(pool)
     }
 }
 
+impl<M: Manager> Pool<M> {
+    /// Start the background reaper if `reap_interval` is configured.
+    ///
+    /// The reaper holds only a [`Weak`] handle, so it never keeps the pool alive;
+    /// it stops when every handle is dropped or the pool is closed. If the OS
+    /// refuses a new thread, the pool keeps working with expiry applied lazily on
+    /// checkout — the reaper is an optimization, not a correctness requirement.
+    fn spawn_reaper(&self) {
+        let Some(interval) = self.0.config.reap_interval else {
+            return;
+        };
+        let pool = Arc::downgrade(&self.0);
+        let shutdown = Arc::clone(&self.0.shutdown);
+        match thread::Builder::new()
+            .name("pool-mod-reaper".to_owned())
+            .spawn(move || reaper_loop(pool, shutdown, interval))
+        {
+            // Detach the handle; the reaper self-terminates via the shutdown
+            // signal and its `Weak` reference.
+            Ok(handle) => drop(handle),
+            // Spawn failed: fall back to lazy, checkout-time expiry.
+            Err(_) => self.0.shutdown.signal(),
+        }
+    }
+}
+
 #[cfg(test)]
+// Justification: in test code a failed setup or checkout has no meaningful
+// recovery — unwinding with a clear panic is the correct outcome. REPS permits
+// `unwrap`/`expect` in test modules for exactly this reason.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -800,6 +955,24 @@ mod tests {
         let p = pool(|b| b.max_size(1));
         let _held = p.try_get().unwrap();
         assert!(matches!(p.try_get(), Err(Error::Timeout)));
+    }
+
+    #[test]
+    fn test_reap_prunes_time_expired_idle() {
+        // A zero idle_timeout makes every idle resource immediately expired, so
+        // `reap` is deterministic without a background thread or sleeps.
+        let p = pool(|b| b.max_size(4).min_idle(2).idle_timeout(Some(Duration::ZERO)));
+        assert_eq!(p.status().idle, 2);
+        p.0.reap();
+        assert_eq!(p.status().idle, 0);
+        assert_eq!(p.status().size, 0);
+    }
+
+    #[test]
+    fn test_reap_is_noop_without_expiry_policy() {
+        let p = pool(|b| b.max_size(4).min_idle(2));
+        p.0.reap();
+        assert_eq!(p.status().idle, 2); // no idle_timeout/max_lifetime: nothing to prune
     }
 
     #[test]

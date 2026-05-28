@@ -152,6 +152,91 @@ fn close_while_borrowed_discards_on_return() {
 }
 
 #[test]
+fn background_reaper_prunes_expired_idle() {
+    let (steer, _created, _) = Steer::new();
+    let pool = Pool::builder(steer)
+        .max_size(4)
+        .idle_timeout(Some(Duration::from_millis(15)))
+        .reap_interval(Some(Duration::from_millis(15)))
+        .build()
+        .expect("configuration is valid");
+
+    // Park two resources in the idle set.
+    let a = pool.get().expect("first");
+    let b = pool.get().expect("second");
+    drop((a, b));
+    assert_eq!(pool.status().idle, 2);
+
+    // Give the reaper several ticks to notice they have aged out.
+    thread::sleep(Duration::from_millis(200));
+
+    let status = pool.status();
+    assert_eq!(
+        status.idle, 0,
+        "reaper should have pruned the aged idle resources"
+    );
+    assert_eq!(status.size, 0);
+}
+
+#[test]
+fn lazy_expiry_keeps_idle_until_borrowed_without_reaper() {
+    let (steer, created, _) = Steer::new();
+    let pool = Pool::builder(steer)
+        .max_size(2)
+        .idle_timeout(Some(Duration::from_millis(15)))
+        // No reap_interval: the reaper is disabled, expiry is lazy.
+        .build()
+        .expect("configuration is valid");
+
+    drop(pool.get().expect("first checkout"));
+    assert_eq!(pool.status().idle, 1);
+
+    thread::sleep(Duration::from_millis(200));
+
+    // With no reaper, the aged resource lingers in the idle set...
+    assert_eq!(pool.status().idle, 1);
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+
+    // ...and is only discarded and replaced when it is next borrowed.
+    let fresh = pool.get().expect("a fresh resource");
+    assert_eq!(*fresh, 1);
+    assert_eq!(created.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn reaper_stops_after_close() {
+    let (steer, _created, _) = Steer::new();
+    let pool = Pool::builder(steer)
+        .max_size(2)
+        .idle_timeout(Some(Duration::from_millis(15)))
+        .reap_interval(Some(Duration::from_millis(15)))
+        .build()
+        .expect("configuration is valid");
+
+    pool.close();
+    assert!(pool.is_closed());
+    // Closing signals the reaper to stop; nothing should hang or panic.
+    thread::sleep(Duration::from_millis(50));
+    assert!(matches!(pool.get(), Err(Error::Closed)));
+}
+
+#[test]
+fn reaper_exits_when_pool_is_dropped() {
+    let (steer, _created, _) = Steer::new();
+    let pool = Pool::builder(steer)
+        .max_size(2)
+        .idle_timeout(Some(Duration::from_millis(15)))
+        .reap_interval(Some(Duration::from_millis(15)))
+        .build()
+        .expect("configuration is valid");
+
+    // Dropping the only handle stops the reaper via the shutdown signal. The test
+    // completing without hanging is the assertion.
+    drop(pool);
+    thread::sleep(Duration::from_millis(50));
+}
+
+#[test]
 fn waiter_is_woken_when_a_resource_returns() {
     let (steer, _created, _) = Steer::new();
     let pool = Pool::builder(steer)

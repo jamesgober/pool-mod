@@ -36,7 +36,7 @@
 - **Min / max sizing** — `min_idle` resources are created up front and kept ready; the pool grows on demand up to `max_size` and never beyond it.
 - **Blocking acquisition with timeouts** — [`get`](./docs/API.md#poolget) waits up to a configured `create_timeout`; [`get_timeout`](./docs/API.md#poolget_timeout) overrides it per call, and [`try_get`](./docs/API.md#pooltry_get) never blocks.
 - **Validation-on-borrow** — an optional `validate` hook (a health-check callback) runs on checkout; a resource that fails is discarded and replaced transparently.
-- **Idle & max-lifetime expiry** — stale resources are dropped and replaced on their next checkout, bounded by `idle_timeout` and `max_lifetime`.
+- **Idle & max-lifetime expiry** — stale resources are dropped and replaced, bounded by `idle_timeout` and `max_lifetime`. Applied lazily on checkout by default, or eagerly by an opt-in background reaper (`reap_interval`).
 - **RAII return** — the [`Pooled`](./docs/API.md#pooled) guard recycles and returns its resource automatically on drop. There is no `release` to forget and no way to leak a resource.
 - **Thread-safe and cheap to share** — [`Pool`](./docs/API.md#pool) is `Send + Sync` and clones into another handle onto the same pool.
 - **Runtime-agnostic, zero-dependency** — no async runtime, no third-party crates.
@@ -50,7 +50,7 @@
 
 ```toml
 [dependencies]
-pool-mod = "0.5"
+pool-mod = "0.9"
 ```
 
 MSRV is Rust 1.75. The crate is edition 2021 and builds on Linux, macOS, and Windows.
@@ -123,6 +123,7 @@ Configure through the [`Builder`](./docs/API.md#builder), or build a [`PoolConfi
 | `create_timeout` | `30s`   | How long `get` waits when saturated. `None` waits indefinitely.    |
 | `idle_timeout`   | `None`  | Replace a resource unused for this long, checked on next borrow.   |
 | `max_lifetime`   | `None`  | Replace a resource older than this, checked on next borrow.        |
+| `reap_interval`  | `None`  | Background prune cadence. `None` applies expiry lazily on borrow.  |
 
 ```rust
 use std::time::Duration;
@@ -213,9 +214,10 @@ cargo fmt --all -- --check
 ## Roadmap
 
 `pool-mod` is fast-tracking to a stable 1.0. Property tests and hot-path
-benchmarks landed in v0.5.0. Still planned before 1.0: a background reaper that
-prunes idle resources eagerly rather than on next checkout, tracked benchmark
-baselines, and the pre-1.0 hardening audit. See
+benchmarks landed in v0.5.0; the opt-in background reaper and the pre-1.0
+hardening audit (zero-dependency, `cargo audit` / `cargo deny` clean, full
+cross-platform matrix on stable and MSRV) landed in v0.9.0. Remaining before 1.0:
+tracked benchmark baselines and the final API freeze. See
 [`.dev/ROADMAP.md`](./.dev/ROADMAP.md).
 
 <br>
