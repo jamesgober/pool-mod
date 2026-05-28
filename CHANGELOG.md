@@ -19,6 +19,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-05-27
+
+### Added
+
+- `Pool::try_get` — a non-blocking checkout that returns `Error::Timeout`
+  immediately when no resource is available, equivalent to
+  `get_timeout(Duration::ZERO)`.
+- Property tests (`proptest`) covering the pool's invariants: configuration
+  validation and pre-warming, the `max_size` ceiling, the `size == idle + in_use`
+  identity, sequential reuse, and close semantics.
+- Integration tests for the lifecycle paths: idle-timeout and max-lifetime
+  expiry over real time, recycle-failure discard, close-while-borrowed, and
+  waiter wake-up on return.
+- Criterion benchmarks for the acquire/return hot path (`benches/pool.rs`):
+  steady-state reuse via `get` and `try_get`, plus `status` sampling.
+
+### Changed
+
+- Pinned the dev-dependency tree in `Cargo.lock` to versions that build on the
+  MSRV (Rust 1.75): `proptest` 1.4, the `clap` 4.5 line, `tempfile` 3.14,
+  `half` 2.4, and the `rand` 0.8 chain. These are dev-only and do not affect
+  published consumers.
+
+---
+
 ## [0.2.0] - 2026-05-27
 
 ### Added
@@ -70,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stripped the UTF-8 BOM and added trailing newlines to the source files to
   satisfy `rustfmt`.
 
-[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...v0.5.0
 [0.2.0]: https://github.com/jamesgober/pool-mod/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/pool-mod/releases/tag/v0.1.0

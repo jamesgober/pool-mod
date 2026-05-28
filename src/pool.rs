@@ -338,6 +338,39 @@ impl<M: Manager> Pool<M> {
         self.acquire(Some(Instant::now() + timeout))
     }
 
+    /// Borrow a resource without ever blocking.
+    ///
+    /// Returns a resource if one can be handed out immediately — an idle resource
+    /// is ready, or the pool has room to create one — and otherwise returns
+    /// [`Error::Timeout`] at once. Equivalent to
+    /// [`get_timeout(Duration::ZERO)`](Pool::get_timeout).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Backend`] if the manager fails to create a resource.
+    /// - [`Error::Timeout`] if no resource is immediately available.
+    /// - [`Error::Closed`] if the pool has been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pool_mod::{Error, Manager, Pool};
+    /// use std::convert::Infallible;
+    /// # struct M;
+    /// # impl Manager for M {
+    /// #   type Resource = u32; type Error = Infallible;
+    /// #   fn create(&self) -> Result<u32, Infallible> { Ok(0) }
+    /// #   fn recycle(&self, _r: &mut u32) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// let pool = Pool::builder(M).max_size(1).build().expect("valid");
+    /// let first = pool.try_get().expect("room to create one");
+    /// // The only slot is taken, so the next try fails immediately.
+    /// assert!(matches!(pool.try_get(), Err(Error::Timeout)));
+    /// ```
+    pub fn try_get(&self) -> Result<Pooled<M>, Error<M::Error>> {
+        self.acquire(Some(Instant::now()))
+    }
+
     fn acquire(&self, deadline: Option<Instant>) -> Result<Pooled<M>, Error<M::Error>> {
         let (resource, created_at) = self.0.acquire(deadline)?;
         Ok(Pooled::new(Arc::clone(&self.0), resource, created_at))
@@ -760,6 +793,13 @@ mod tests {
             .min_idle(3)
             .build();
         assert!(matches!(result, Err(Error::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn test_try_get_does_not_block_when_saturated() {
+        let p = pool(|b| b.max_size(1));
+        let _held = p.try_get().unwrap();
+        assert!(matches!(p.try_get(), Err(Error::Timeout)));
     }
 
     #[test]

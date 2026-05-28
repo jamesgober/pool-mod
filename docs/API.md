@@ -16,7 +16,7 @@
 <br>
 
 `pool-mod` is a generic object and connection pool. This document is the complete
-reference for the public API as of `v0.2.0`: every exported item, what it does,
+reference for the public API as of `v0.5.0`: every exported item, what it does,
 the meaning of each parameter and return value, the error semantics, and runnable
 examples for each use case.
 
@@ -35,6 +35,7 @@ The whole pooling surface lives behind the default `std` feature. With
     - [`Pool::new`](#poolnew)
     - [`Pool::get`](#poolget)
     - [`Pool::get_timeout`](#poolget_timeout)
+    - [`Pool::try_get`](#pooltry_get)
     - [`Pool::status`](#poolstatus)
     - [`Pool::close`](#poolclose)
     - [`Pool::is_closed`](#poolis_closed)
@@ -57,7 +58,7 @@ The whole pooling surface lives behind the default `std` feature. With
 
 ```toml
 [dependencies]
-pool-mod = "0.2"
+pool-mod = "0.5"
 ```
 
 The crate is edition 2021 with a Minimum Supported Rust Version of 1.75, and
@@ -337,6 +338,35 @@ let pool = Pool::builder(M).max_size(1).build().expect("valid");
 let held = pool.get().expect("first checkout");
 // The single slot is taken, so an immediate retry times out.
 assert!(matches!(pool.get_timeout(Duration::ZERO), Err(Error::Timeout)));
+```
+
+#### `Pool::try_get`
+
+```rust
+pub fn try_get(&self) -> Result<Pooled<M>, Error<M::Error>>
+```
+
+Borrow a resource without ever blocking. Returns a resource if one can be handed
+out immediately — an idle resource is ready, or the pool has room to create one —
+and otherwise returns [`Error::Timeout`](#error) at once. Equivalent to
+[`get_timeout(Duration::ZERO)`](#poolget_timeout).
+
+**Errors:** identical to [`Pool::get`](#poolget); `Timeout` is returned the
+instant no resource is available rather than after a wait.
+
+```rust
+use pool_mod::{Error, Manager, Pool};
+# use std::convert::Infallible;
+# struct M;
+# impl Manager for M {
+#   type Resource = u32; type Error = Infallible;
+#   fn create(&self) -> Result<u32, Infallible> { Ok(0) }
+#   fn recycle(&self, _r: &mut u32) -> Result<(), Infallible> { Ok(()) }
+# }
+let pool = Pool::builder(M).max_size(1).build().expect("valid");
+let first = pool.try_get().expect("room to create one");
+// The only slot is taken, so the next try fails immediately.
+assert!(matches!(pool.try_get(), Err(Error::Timeout)));
 ```
 
 #### `Pool::status`
@@ -747,11 +777,11 @@ pub const VERSION: &str;
 ```
 
 The crate version string, populated from `CARGO_PKG_VERSION` at build time —
-`"0.2.0"` for this release. Available even under `no_std`. Useful in a `--version`
+`"0.5.0"` for this release. Available even under `no_std`. Useful in a `--version`
 banner, a startup log line, or a diagnostics endpoint.
 
 ```rust
-assert_eq!(pool_mod::VERSION, "0.2.0");
+assert_eq!(pool_mod::VERSION, "0.5.0");
 ```
 
 ## Patterns

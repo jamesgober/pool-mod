@@ -34,7 +34,7 @@
 
 - **Generic over any resource** — pool connections, clients, threads, buffers, or anything else through one [`Manager`](./docs/API.md#manager) trait.
 - **Min / max sizing** — `min_idle` resources are created up front and kept ready; the pool grows on demand up to `max_size` and never beyond it.
-- **Blocking acquisition with timeouts** — [`get`](./docs/API.md#poolget) waits up to a configured `create_timeout`; [`get_timeout`](./docs/API.md#poolget_timeout) overrides it per call, and `Duration::ZERO` makes a non-blocking try.
+- **Blocking acquisition with timeouts** — [`get`](./docs/API.md#poolget) waits up to a configured `create_timeout`; [`get_timeout`](./docs/API.md#poolget_timeout) overrides it per call, and [`try_get`](./docs/API.md#pooltry_get) never blocks.
 - **Validation-on-borrow** — an optional `validate` hook (a health-check callback) runs on checkout; a resource that fails is discarded and replaced transparently.
 - **Idle & max-lifetime expiry** — stale resources are dropped and replaced on their next checkout, bounded by `idle_timeout` and `max_lifetime`.
 - **RAII return** — the [`Pooled`](./docs/API.md#pooled) guard recycles and returns its resource automatically on drop. There is no `release` to forget and no way to leak a resource.
@@ -50,7 +50,7 @@
 
 ```toml
 [dependencies]
-pool-mod = "0.2"
+pool-mod = "0.5"
 ```
 
 MSRV is Rust 1.75. The crate is edition 2021 and builds on Linux, macOS, and Windows.
@@ -169,7 +169,7 @@ A native non-blocking async acquisition API is on the roadmap (see below).
 For the complete reference — every public item, its parameters, return values, error semantics, and runnable examples — see [`docs/API.md`](./docs/API.md).
 
 - [`Manager`](./docs/API.md#manager) — the trait you implement: `create`, `recycle`, and the optional `validate` health check.
-- [`Pool`](./docs/API.md#pool) — `builder` / `new`, `get` / `get_timeout`, `status`, `close`, `is_closed`.
+- [`Pool`](./docs/API.md#pool) — `builder` / `new`, `get` / `get_timeout` / `try_get`, `status`, `close`, `is_closed`.
 - [`Builder`](./docs/API.md#builder) — fluent configuration.
 - [`PoolConfig`](./docs/API.md#poolconfig) — limits and lifecycle policy.
 - [`Pooled`](./docs/API.md#pooled) — the RAII guard, deref-coercing to your resource.
@@ -191,9 +191,17 @@ operating systems, across both the stable toolchain and the MSRV (1.75).
 
 ## Testing
 
+The suite covers every lifecycle path with unit tests, an eight-thread
+concurrency test, `proptest` properties for the pool's invariants (the `max_size`
+ceiling, the `size == idle + in_use` identity, reuse, and close semantics), and
+doctests on every public item.
+
 ```bash
-# Full suite (unit, integration, and doctests)
+# Full suite (unit, integration, property, and doctests)
 cargo test --all-features
+
+# Microbenchmarks for the acquire/return hot path
+cargo bench
 
 # Lints and formatting, as enforced in CI
 cargo clippy --all-targets --all-features -- -D warnings
@@ -204,10 +212,10 @@ cargo fmt --all -- --check
 
 ## Roadmap
 
-`pool-mod` is fast-tracking to a stable 1.0. Planned before then: a background
-reaper that prunes idle resources eagerly rather than on next checkout, a native
-async acquisition API behind an opt-in feature, benchmarks with tracked
-baselines, and property tests for the pool's invariants. See
+`pool-mod` is fast-tracking to a stable 1.0. Property tests and hot-path
+benchmarks landed in v0.5.0. Still planned before 1.0: a background reaper that
+prunes idle resources eagerly rather than on next checkout, tracked benchmark
+baselines, and the pre-1.0 hardening audit. See
 [`.dev/ROADMAP.md`](./.dev/ROADMAP.md).
 
 <br>

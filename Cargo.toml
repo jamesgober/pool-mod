@@ -1,6 +1,6 @@
 ﻿[package]
 name = "pool-mod"
-version = "0.2.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.75"
 readme = "README.md"
@@ -44,6 +44,21 @@ std = []
 [dependencies]
 
 [dev-dependencies]
+# Property-based tests for the pool's sizing and lifecycle invariants.
+proptest = "1"
+# Microbenchmarks for the acquire/return hot path. Default features are disabled
+# to keep the dev-dependency tree (and the MSRV surface) small.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+# The committed `Cargo.lock` pins this dev-dependency tree to versions that still
+# build on the MSRV (Rust 1.75). Newer releases of these crates require a newer
+# compiler; they are dev-only and never reach published consumers. Re-pin with
+# `cargo update -p <crate> --precise <ver>` if you bump the MSRV.
+
+[[bench]]
+name = "pool"
+harness = false
+required-features = ["std"]
 
 [profile.release]
 opt-level = 3
