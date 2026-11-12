@@ -187,7 +187,7 @@ background reaper — lands here; the rest is audit and verification.
 ### Added
 
 - Initial scaffold and repository bootstrap: `Cargo.toml`, dual `LICENSE-APACHE` /
-  `LICENSE-MIT`, `README.md`, `CHANGELOG.md`, and the `.dev/` milestone plan.
+  `LICENSE-MIT`, `README.md`, and `CHANGELOG.md`.
 - Crate root (`src/lib.rs`) with the REPS lint discipline denied at the crate
   level, plus a `VERSION` constant and a smoke test asserting it is populated.
 - Canonical `REPS.md` (v0.2.0) as the repository's supreme engineering standard.
