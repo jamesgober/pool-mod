@@ -1,6 +1,7 @@
 //! The pool itself: [`Pool`] and its [`Builder`].
 
 use std::collections::VecDeque;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,24 +33,134 @@ pub(crate) struct Idle<R> {
 
 /// The mutable inner state guarded by the pool's mutex.
 struct State<R> {
+    /// Idle resources. Check-in pushes to the back and checkout pops from the
+    /// back (LIFO), so the most recently used resource is reused first and the
+    /// front holds the least recently used ones, which are the first to reach
+    /// `idle_timeout`.
     idle: VecDeque<Idle<R>>,
     /// Resources the pool currently owns: idle, checked out, or mid-creation.
     total: usize,
-    /// Threads currently blocked in [`PoolInner::acquire`] waiting on `available`.
-    /// Maintained under the lock so the wakers can skip the condvar entirely when
-    /// no one is waiting — the common, uncontended case.
-    waiters: usize,
+    /// Threads blocked in [`PoolInner::reserve`], oldest first. Each waiter
+    /// sleeps on its own condition variable, so a waker can signal exactly the
+    /// oldest one, and only the oldest waiter may take a resource from inside
+    /// the queue. A thread that arrives while the oldest waiter has waited
+    /// longer than [`STARVATION_LIMIT`] joins the back instead of taking a
+    /// resource ahead of it.
+    queue: VecDeque<Arc<Waiter>>,
     closed: bool,
+}
+
+/// How long the oldest waiter may wait before newly arriving threads stop
+/// taking resources ahead of it.
+///
+/// Below this, a thread that finds a resource free takes it at once, even when
+/// others are waiting: handing every returned resource to a sleeping thread
+/// costs a context switch per checkout, which under saturation cut throughput
+/// by more than ten times in measurement. Past it, newcomers queue behind the
+/// waiters, so no waiter is passed over for longer than about this long plus
+/// one resource hold time.
+const STARVATION_LIMIT: Duration = Duration::from_millis(1);
+
+/// A thread blocked in [`PoolInner::reserve`].
+struct Waiter {
+    wake: Condvar,
+    since: Instant,
+}
+
+impl<R> State<R> {
+    /// Whether a checkout could succeed right now: an idle resource is ready or
+    /// there is room to create one.
+    #[inline]
+    fn has_capacity(&self, max_size: usize) -> bool {
+        !self.idle.is_empty() || self.total < max_size
+    }
+
+    /// The oldest waiter, if any, cloned so it can be signalled after the lock
+    /// is released.
+    #[inline]
+    fn head(&self) -> Option<Arc<Waiter>> {
+        self.queue.front().cloned()
+    }
+
+    /// Whether a newly arriving thread may take a resource now: nobody is
+    /// waiting, or the oldest waiter has not yet waited past
+    /// [`STARVATION_LIMIT`].
+    #[inline]
+    fn newcomer_may_take(&self) -> bool {
+        self.queue
+            .front()
+            .map_or(true, |head| head.since.elapsed() < STARVATION_LIMIT)
+    }
+
+    /// Whether `waiter` is the oldest waiter.
+    #[inline]
+    fn is_head(&self, waiter: &Arc<Waiter>) -> bool {
+        self.queue
+            .front()
+            .is_some_and(|front| Arc::ptr_eq(front, waiter))
+    }
+
+    /// Remove `waiter` from the queue. If it was the oldest waiter and a
+    /// checkout could now succeed, return the new oldest waiter so the caller
+    /// can pass the turn on.
+    fn leave(&mut self, waiter: &Arc<Waiter>, max_size: usize) -> Option<Arc<Waiter>> {
+        let was_head = self.is_head(waiter);
+        self.queue.retain(|queued| !Arc::ptr_eq(queued, waiter));
+        if was_head && self.has_capacity(max_size) {
+            self.head()
+        } else {
+            None
+        }
+    }
+}
+
+/// Signal a waiter taken from [`State::head`], if there was one.
+#[inline]
+fn notify(waiter: Option<Arc<Waiter>>) {
+    if let Some(waiter) = waiter {
+        waiter.wake.notify_one();
+    }
 }
 
 /// The decision reached while holding the lock, carried out once it is released.
 ///
-/// Only outcomes that require running user code — and therefore must not hold the
-/// lock — escape the locked region; waiting and immediate errors are handled in
+/// Only outcomes that require running user code (and therefore must not hold the
+/// lock) escape the locked region; waiting and immediate errors are handled in
 /// place.
 enum Action<R> {
     Reuse(Idle<R>),
     Create,
+}
+
+/// Gives a reserved slot back to the pool when dropped, unless disarmed.
+///
+/// Every path that reserves a slot (`total += 1`) and then runs user code
+/// (`create`, `validate`, `recycle`) holds one of these, so a hook that panics
+/// cannot leave the slot counted with no resource behind it.
+struct SlotGuard<'a, M: Manager> {
+    pool: &'a PoolInner<M>,
+    armed: bool,
+}
+
+impl<'a, M: Manager> SlotGuard<'a, M> {
+    #[inline]
+    fn new(pool: &'a PoolInner<M>) -> Self {
+        SlotGuard { pool, armed: true }
+    }
+
+    /// Keep the slot: it now belongs to a live resource.
+    #[inline]
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl<M: Manager> Drop for SlotGuard<'_, M> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.pool.release_slot();
+        }
+    }
 }
 
 /// The stop signal shared between the pool and its background reaper thread.
@@ -85,7 +196,6 @@ pub(crate) struct PoolInner<M: Manager> {
     pub(crate) manager: M,
     config: PoolConfig,
     state: Mutex<State<M::Resource>>,
-    available: Condvar,
     shutdown: Arc<Shutdown>,
 }
 
@@ -100,71 +210,129 @@ impl<M: Manager> Drop for PoolInner<M> {
 impl<M: Manager> PoolInner<M> {
     /// Take a resource out of the pool, blocking until one is free, a slot opens
     /// for a fresh one, or the deadline passes.
+    ///
+    /// With `allow_create` false the pool never runs `create`: it hands out an
+    /// idle resource or returns [`Error::Timeout`].
     fn acquire(
         &self,
         deadline: Option<Instant>,
+        allow_create: bool,
     ) -> Result<(M::Resource, Instant), Error<M::Error>> {
         loop {
-            let action = {
-                let mut state = lock(&self.state);
-                loop {
-                    if state.closed {
-                        return Err(Error::Closed);
-                    }
-                    if let Some(idle) = state.idle.pop_front() {
-                        break Action::Reuse(idle);
-                    }
-                    if state.total < self.config.max_size {
-                        state.total += 1;
-                        break Action::Create;
-                    }
-                    // Saturated: wait for a check-in or a close, then re-evaluate.
-                    // `waiters` is bumped immediately before sleeping and dropped
-                    // the moment we wake, both under the lock, so a waker can tell
-                    // whether a signal is needed at all.
-                    match deadline {
-                        None => {
-                            state.waiters += 1;
-                            state = self
-                                .available
-                                .wait(state)
-                                .unwrap_or_else(PoisonError::into_inner);
-                            state.waiters -= 1;
-                        }
-                        Some(dl) => {
-                            let now = Instant::now();
-                            if now >= dl {
-                                return Err(Error::Timeout);
-                            }
-                            state.waiters += 1;
-                            let (guard, _) = self
-                                .available
-                                .wait_timeout(state, dl - now)
-                                .unwrap_or_else(PoisonError::into_inner);
-                            state = guard;
-                            state.waiters -= 1;
-                        }
-                    }
-                }
-            };
-
-            match action {
+            match self.reserve(deadline, allow_create)? {
                 Action::Reuse(idle) => {
+                    // The idle resource still holds its slot. If validation
+                    // rejects it or panics, the guard gives the slot back.
+                    let slot = SlotGuard::new(self);
                     if let Some(prepared) = self.prepare(idle) {
+                        slot.disarm();
                         return Ok(prepared);
                     }
-                    // The idle resource was stale or invalid and has been dropped;
-                    // release its slot and try again from the top.
-                    self.release_slot();
+                    // The idle resource was stale or invalid and has been
+                    // dropped; `slot` releases its slot here. Try again.
                 }
-                Action::Create => match self.manager.create() {
-                    Ok(resource) => return Ok((resource, Instant::now())),
-                    Err(source) => {
-                        self.release_slot();
-                        return Err(Error::Backend(source));
+                Action::Create => {
+                    let slot = SlotGuard::new(self);
+                    match self.manager.create_with_deadline(deadline) {
+                        Ok(resource) => {
+                            slot.disarm();
+                            return Ok((resource, Instant::now()));
+                        }
+                        Err(source) => {
+                            drop(slot);
+                            return Err(Error::Backend(source));
+                        }
                     }
-                },
+                }
             }
+        }
+    }
+
+    /// The locked half of [`acquire`](Self::acquire): pop an idle resource or
+    /// reserve a slot, waiting in arrival order while the pool is saturated.
+    fn reserve(
+        &self,
+        deadline: Option<Instant>,
+        allow_create: bool,
+    ) -> Result<Action<M::Resource>, Error<M::Error>> {
+        let max_size = self.config.max_size;
+        let mut state = lock(&self.state);
+        // This thread's place in the wait queue, once it has had to wait.
+        let mut me: Option<Arc<Waiter>> = None;
+        loop {
+            if state.closed {
+                if let Some(waiter) = &me {
+                    let _ = state.leave(waiter, max_size);
+                }
+                return Err(Error::Closed);
+            }
+            let my_turn = match &me {
+                None => state.newcomer_may_take(),
+                Some(waiter) => state.is_head(waiter),
+            };
+            if my_turn {
+                let action = if let Some(idle) = state.idle.pop_back() {
+                    Some(Action::Reuse(idle))
+                } else if allow_create && state.total < max_size {
+                    state.total += 1;
+                    Some(Action::Create)
+                } else {
+                    None
+                };
+                if let Some(action) = action {
+                    if me.is_some() {
+                        let _ = state.queue.pop_front();
+                    }
+                    // Wake the oldest waiter if it could also be served.
+                    let next = if state.has_capacity(max_size) {
+                        state.head()
+                    } else {
+                        None
+                    };
+                    drop(state);
+                    notify(next);
+                    return Ok(action);
+                }
+            }
+
+            // Saturated, or a starved waiter is ahead of us: wait for our turn.
+            let wait_for = match deadline {
+                None => None,
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        let next = match &me {
+                            Some(waiter) => state.leave(waiter, max_size),
+                            None => None,
+                        };
+                        drop(state);
+                        notify(next);
+                        return Err(Error::Timeout);
+                    }
+                    Some(dl - now)
+                }
+            };
+            let waiter = me.get_or_insert_with(|| {
+                let waiter = Arc::new(Waiter {
+                    wake: Condvar::new(),
+                    since: Instant::now(),
+                });
+                state.queue.push_back(Arc::clone(&waiter));
+                waiter
+            });
+            state = match wait_for {
+                None => waiter
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+                Some(timeout) => {
+                    waiter
+                        .wake
+                        .wait_timeout(state, timeout)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
         }
     }
 
@@ -174,13 +342,19 @@ impl<M: Manager> PoolInner<M> {
     /// `None` (dropping the resource) when it is too old, has sat idle too long,
     /// or fails validation.
     fn prepare(&self, mut idle: Idle<M::Resource>) -> Option<(M::Resource, Instant)> {
-        if self.is_time_expired(&idle, Instant::now()) {
+        if self.has_expiry() && self.is_time_expired(&idle, Instant::now()) {
             return None;
         }
         if !self.manager.validate(&mut idle.resource) {
             return None;
         }
         Some((idle.resource, idle.created_at))
+    }
+
+    /// Whether any time-based expiry policy is configured.
+    #[inline]
+    fn has_expiry(&self) -> bool {
+        self.config.idle_timeout.is_some() || self.config.max_lifetime.is_some()
     }
 
     /// Whether an idle resource has outlived `max_lifetime` or `idle_timeout`.
@@ -203,90 +377,133 @@ impl<M: Manager> PoolInner<M> {
         false
     }
 
-    /// Prune idle resources that have outlived their `idle_timeout` or
-    /// `max_lifetime`. Called on each tick of the background reaper.
+    /// One pass of the background reaper: prune idle resources that have
+    /// outlived their `idle_timeout` or `max_lifetime`, then create resources
+    /// until the idle set is back at `min_idle` (never past `max_size`).
     ///
-    /// Expired resources are removed under the lock but dropped outside it, so a
-    /// slow destructor does not stall checkouts. The reaper never creates
-    /// resources; pruning shrinks the idle set, and on-demand growth refills it.
+    /// Expired resources are removed under the lock but dropped outside it, and
+    /// new ones are created outside it, so neither a slow destructor nor a slow
+    /// `create` stalls checkouts.
     fn reap(&self) {
-        if self.config.idle_timeout.is_none() && self.config.max_lifetime.is_none() {
-            return;
-        }
         let now = Instant::now();
         let mut expired = Vec::new();
-        let waiters;
+        let refill;
+        let next;
         {
             let mut state = lock(&self.state);
             if state.closed {
                 return;
             }
-            let mut kept = VecDeque::with_capacity(state.idle.len());
-            while let Some(idle) = state.idle.pop_front() {
-                if self.is_time_expired(&idle, now) {
-                    expired.push(idle.resource);
-                } else {
-                    kept.push_back(idle);
+            if self.has_expiry() {
+                let mut kept = VecDeque::with_capacity(state.idle.len());
+                while let Some(idle) = state.idle.pop_front() {
+                    if self.is_time_expired(&idle, now) {
+                        expired.push(idle.resource);
+                    } else {
+                        kept.push_back(idle);
+                    }
                 }
+                state.total = state.total.saturating_sub(expired.len());
+                state.idle = kept;
             }
-            state.total = state.total.saturating_sub(expired.len());
-            state.idle = kept;
-            waiters = state.waiters;
+            // Reserve the slots for the refill now, in the same critical
+            // section, so the pool never looks emptier than it is about to be.
+            let below_floor = self.config.min_idle.saturating_sub(state.idle.len());
+            let room = self.config.max_size.saturating_sub(state.total);
+            refill = below_floor.min(room);
+            state.total += refill;
+            next = if expired.is_empty() {
+                None
+            } else {
+                state.head()
+            };
         }
         drop(expired); // destructors run here, outside the lock
-                       // Freed slots may unblock threads waiting to create a resource.
-        self.wake_all(waiters);
+        notify(next); // freed slots may unblock a thread waiting to create
+        for created in 0..refill {
+            let slot = SlotGuard::new(self);
+            match self.manager.create_with_deadline(None) {
+                Ok(resource) => {
+                    let now = Instant::now();
+                    let mut state = lock(&self.state);
+                    if state.closed {
+                        drop(state);
+                        drop(resource);
+                        // `slot` releases the slot.
+                        self.release_slots(refill - created - 1);
+                        return;
+                    }
+                    state.idle.push_back(Idle {
+                        resource,
+                        created_at: now,
+                        last_used: now,
+                    });
+                    slot.disarm();
+                    let next = state.head();
+                    drop(state);
+                    notify(next);
+                }
+                Err(_) => {
+                    // Give back this slot and the ones not yet used; on-demand
+                    // creation will surface the error to a caller.
+                    drop(slot);
+                    self.release_slots(refill - created - 1);
+                    return;
+                }
+            }
+        }
     }
 
-    /// Give back a reserved slot and wake one waiter, if any, so it can claim it.
-    fn release_slot(&self) {
+    /// Give back a reserved slot and wake the oldest waiter, if any, so it can
+    /// claim it. Also used by [`Pooled::detach`] and [`Pooled::discard`].
+    pub(crate) fn release_slot(&self) {
+        self.release_slots(1);
+    }
+
+    /// Give back `count` reserved slots and wake the oldest waiter, if any.
+    fn release_slots(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
         let mut state = lock(&self.state);
-        state.total = state.total.saturating_sub(1);
-        let waiters = state.waiters;
+        state.total = state.total.saturating_sub(count);
+        let next = state.head();
         drop(state);
-        self.wake_one(waiters);
+        notify(next);
     }
 
     /// Return a borrowed resource to the pool. Called from [`Pooled`]'s `Drop`.
-    pub(crate) fn checkin(&self, mut resource: M::Resource, created_at: Instant) {
-        let recycled = self.manager.recycle(&mut resource);
+    pub(crate) fn checkin(&self, resource: M::Resource, created_at: Instant) {
+        // Declared before `resource` so the resource is dropped first and the
+        // slot released after it, on every path including a panic in `recycle`.
+        let slot = SlotGuard::new(self);
+        let mut resource = resource;
+        if thread::panicking() {
+            // The borrower is unwinding, so the resource may be half way through
+            // an operation. Never pool it, and do not call `recycle`: a second
+            // panic during unwinding would abort the process.
+            drop(resource);
+            return;
+        }
+        if self.manager.recycle(&mut resource).is_err() {
+            drop(resource);
+            return;
+        }
         let mut state = lock(&self.state);
-        let waiters = state.waiters;
-        if state.closed || recycled.is_err() {
-            state.total = state.total.saturating_sub(1);
+        if state.closed {
             drop(state);
-            self.wake_one(waiters);
-            // `resource` is dropped here, outside the lock.
-        } else {
-            let last_used = Instant::now();
-            state.idle.push_back(Idle {
-                resource,
-                created_at,
-                last_used,
-            });
-            drop(state);
-            self.wake_one(waiters);
+            drop(resource); // outside the lock; `slot` then releases the slot
+            return;
         }
-    }
-
-    /// Wake a single blocked acquirer, but only if one is actually waiting.
-    ///
-    /// `waiters` is the count read under the lock by the caller; skipping the
-    /// condvar when it is zero keeps the uncontended checkout/return path free of
-    /// needless signaling.
-    #[inline]
-    fn wake_one(&self, waiters: usize) {
-        if waiters > 0 {
-            self.available.notify_one();
-        }
-    }
-
-    /// Wake every blocked acquirer, but only if any are waiting.
-    #[inline]
-    fn wake_all(&self, waiters: usize) {
-        if waiters > 0 {
-            self.available.notify_all();
-        }
+        state.idle.push_back(Idle {
+            resource,
+            created_at,
+            last_used: Instant::now(),
+        });
+        slot.disarm(); // the idle entry now holds the slot
+        let next = state.head();
+        drop(state);
+        notify(next);
     }
 }
 
@@ -312,10 +529,22 @@ fn reaper_loop<M: Manager>(pool: Weak<PoolInner<M>>, shutdown: Arc<Shutdown>, in
             }
         }
         match pool.upgrade() {
-            Some(inner) => inner.reap(),
+            // A panicking `create` during the refill must not end the reaper.
+            // The slot guards have already restored the pool's counts, so the
+            // pool is consistent and the next pass can carry on.
+            Some(inner) => {
+                let _ = panic::catch_unwind(AssertUnwindSafe(|| inner.reap()));
+            }
             None => return,
         }
     }
+}
+
+/// The instant `timeout` from now, or `None` (no deadline) when that instant
+/// cannot be represented, as with [`Duration::MAX`].
+#[inline]
+fn deadline_after(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
 }
 
 /// A thread-safe pool of reusable resources.
@@ -324,6 +553,13 @@ fn reaper_loop<M: Manager>(pool: Weak<PoolInner<M>>, shutdown: Arc<Shutdown>, in
 /// recycling each one when its [`Pooled`] guard is dropped. It is cheap to clone
 /// — every clone is a handle onto the same shared pool — so share it across
 /// threads by cloning rather than wrapping it in another `Arc`.
+///
+/// Threads that have to wait for a resource are served in arrival order, and a
+/// returned resource is offered to the thread that has waited longest. A thread
+/// that arrives and finds a resource free may still take it first, which keeps
+/// throughput high under contention, but only while the oldest waiter has
+/// waited less than about a millisecond; after that, newcomers queue behind the
+/// waiters, so no waiter is passed over indefinitely.
 ///
 /// The pool is runtime-agnostic and carries no async dependency.
 /// [`get`](Pool::get) blocks the calling thread until a resource is available; in
@@ -418,7 +654,14 @@ impl<M: Manager> Pool<M> {
     ///
     /// Reuses an idle resource when one is available (after validation), grows the
     /// pool toward `max_size` when it is not, and otherwise blocks until a
-    /// resource is returned or the timeout elapses.
+    /// resource is returned or the timeout elapses. Threads that have to wait are
+    /// served in arrival order (see [`Pool`] for the fairness rule).
+    ///
+    /// The timeout bounds the wait for a free resource or slot. It does not bound
+    /// [`Manager::validate`] or [`Manager::create`] once one of them has started;
+    /// the deadline is passed to [`Manager::create_with_deadline`] so a manager
+    /// can bound its own connect time. A timeout too large to represent as an
+    /// [`Instant`] (such as [`Duration::MAX`]) waits indefinitely.
     ///
     /// # Errors
     ///
@@ -442,19 +685,19 @@ impl<M: Manager> Pool<M> {
     /// assert_eq!(*resource, 7);
     /// ```
     pub fn get(&self) -> Result<Pooled<M>, Error<M::Error>> {
-        let deadline = self
-            .0
-            .config
-            .create_timeout
-            .map(|timeout| Instant::now() + timeout);
-        self.acquire(deadline)
+        let deadline = self.0.config.create_timeout.and_then(deadline_after);
+        self.acquire(deadline, true)
     }
 
-    /// Borrow a resource, waiting at most `timeout` regardless of the configured
+    /// Borrow a resource, waiting at most `timeout` for a free resource or slot,
+    /// regardless of the configured
     /// [`create_timeout`](PoolConfig::create_timeout).
     ///
-    /// A `timeout` of [`Duration::ZERO`] makes this a non-blocking try: it returns
-    /// [`Error::Timeout`] at once if no resource can be handed out immediately.
+    /// A `timeout` of [`Duration::ZERO`] never waits for another thread: it returns
+    /// [`Error::Timeout`] at once if no resource can be handed out immediately. As
+    /// with [`get`](Pool::get), the timeout does not bound a `validate` or
+    /// `create` call that has already started, and a timeout too large to
+    /// represent waits indefinitely.
     ///
     /// # Errors
     ///
@@ -480,15 +723,19 @@ impl<M: Manager> Pool<M> {
     /// assert!(matches!(pool.get_timeout(Duration::ZERO), Err(Error::Timeout)));
     /// ```
     pub fn get_timeout(&self, timeout: Duration) -> Result<Pooled<M>, Error<M::Error>> {
-        self.acquire(Some(Instant::now() + timeout))
+        self.acquire(deadline_after(timeout), true)
     }
 
-    /// Borrow a resource without ever blocking.
+    /// Borrow a resource without waiting for another thread to return one.
     ///
-    /// Returns a resource if one can be handed out immediately — an idle resource
-    /// is ready, or the pool has room to create one — and otherwise returns
+    /// Returns a resource if one can be handed out immediately (an idle resource
+    /// is ready, or the pool has room to create one) and otherwise returns
     /// [`Error::Timeout`] at once. Equivalent to
     /// [`get_timeout(Duration::ZERO)`](Pool::get_timeout).
+    ///
+    /// When the pool has room, this runs [`Manager::create`] on the calling
+    /// thread, which takes as long as the manager takes. To never run `create`,
+    /// use [`try_get_idle`](Pool::try_get_idle).
     ///
     /// # Errors
     ///
@@ -513,11 +760,50 @@ impl<M: Manager> Pool<M> {
     /// assert!(matches!(pool.try_get(), Err(Error::Timeout)));
     /// ```
     pub fn try_get(&self) -> Result<Pooled<M>, Error<M::Error>> {
-        self.acquire(Some(Instant::now()))
+        self.acquire(Some(Instant::now()), true)
     }
 
-    fn acquire(&self, deadline: Option<Instant>) -> Result<Pooled<M>, Error<M::Error>> {
-        let (resource, created_at) = self.0.acquire(deadline)?;
+    /// Borrow an idle resource without waiting and without creating one.
+    ///
+    /// Returns an idle resource (after the usual expiry and
+    /// [`validate`](Manager::validate) checks) if one is ready and no other thread
+    /// is already waiting, and otherwise returns [`Error::Timeout`] at once. It
+    /// never calls [`Manager::create`], so it never waits on a backend connect;
+    /// the only user code it runs is `validate`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Timeout`] if no idle resource is ready.
+    /// - [`Error::Closed`] if the pool has been closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pool_mod::{Error, Manager, Pool};
+    /// use std::convert::Infallible;
+    /// # struct M;
+    /// # impl Manager for M {
+    /// #   type Resource = u32; type Error = Infallible;
+    /// #   fn create(&self) -> Result<u32, Infallible> { Ok(0) }
+    /// #   fn recycle(&self, _r: &mut u32) -> Result<(), Infallible> { Ok(()) }
+    /// # }
+    /// let pool = Pool::builder(M).max_size(2).build().expect("valid");
+    /// // Nothing has been created yet, and this call does not create anything.
+    /// assert!(matches!(pool.try_get_idle(), Err(Error::Timeout)));
+    ///
+    /// drop(pool.get().expect("room to create one"));
+    /// assert!(pool.try_get_idle().is_ok()); // the returned resource is idle now
+    /// ```
+    pub fn try_get_idle(&self) -> Result<Pooled<M>, Error<M::Error>> {
+        self.acquire(Some(Instant::now()), false)
+    }
+
+    fn acquire(
+        &self,
+        deadline: Option<Instant>,
+        allow_create: bool,
+    ) -> Result<Pooled<M>, Error<M::Error>> {
+        let (resource, created_at) = self.0.acquire(deadline, allow_create)?;
         Ok(Pooled::new(Arc::clone(&self.0), resource, created_at))
     }
 
@@ -580,9 +866,12 @@ impl<M: Manager> Pool<M> {
         let drained = std::mem::take(&mut state.idle);
         state.total = state.total.saturating_sub(drained.len());
         state.closed = true;
-        let waiters = state.waiters;
+        let waiters: Vec<Arc<Waiter>> = state.queue.iter().cloned().collect();
         drop(state);
-        self.0.wake_all(waiters); // wake blocked acquirers so they observe the close
+        // Wake every blocked acquirer so it observes the close.
+        for waiter in waiters {
+            waiter.wake.notify_one();
+        }
         self.0.shutdown.signal(); // stop the reaper; a closed pool needs no upkeep
         drop(drained); // resource destructors run here, outside the lock
     }
@@ -642,14 +931,17 @@ impl<M: Manager> Builder<M> {
         self
     }
 
-    /// Set how many resources to create up front and keep ready.
+    /// Set how many idle resources to create up front. When a
+    /// [`reap_interval`](Builder::reap_interval) is set, the reaper also refills
+    /// the idle set to this floor on each pass.
     pub fn min_idle(mut self, min_idle: usize) -> Self {
         self.config.min_idle = min_idle;
         self
     }
 
-    /// Set how long [`Pool::get`] waits when the pool is saturated. `None` waits
-    /// indefinitely.
+    /// Set how long [`Pool::get`] waits for a free resource or slot when the pool
+    /// is saturated. `None` waits indefinitely. This bounds waiting only, not
+    /// [`Manager::create`]; see [`Manager::create_with_deadline`].
     pub fn create_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.config.create_timeout = timeout;
         self
@@ -667,10 +959,10 @@ impl<M: Manager> Builder<M> {
         self
     }
 
-    /// Set how often a background thread prunes expired idle resources. `None`
-    /// (the default) runs no background thread, applying expiry lazily on borrow.
-    ///
-    /// Has no effect unless `idle_timeout` or `max_lifetime` is also set.
+    /// Set how often a background thread prunes expired idle resources and
+    /// refills the idle set to `min_idle`. `None` (the default) runs no
+    /// background thread: expiry is applied lazily on borrow and the idle set is
+    /// refilled only on demand.
     pub fn reap_interval(mut self, interval: Option<Duration>) -> Self {
         self.config.reap_interval = interval;
         self
@@ -723,15 +1015,14 @@ impl<M: Manager> Builder<M> {
             state: Mutex::new(State {
                 idle: VecDeque::with_capacity(self.config.max_size),
                 total: 0,
-                waiters: 0,
+                queue: VecDeque::new(),
                 closed: false,
             }),
-            available: Condvar::new(),
             shutdown: Arc::new(Shutdown::new()),
         }));
 
         for _ in 0..pool.0.config.min_idle {
-            match pool.0.manager.create() {
+            match pool.0.manager.create_with_deadline(None) {
                 Ok(resource) => {
                     let now = Instant::now();
                     let mut state = lock(&pool.0.state);
@@ -995,11 +1286,138 @@ mod tests {
     fn test_reap_prunes_time_expired_idle() {
         // A zero idle_timeout makes every idle resource immediately expired, so
         // `reap` is deterministic without a background thread or sleeps.
-        let p = pool(|b| b.max_size(4).min_idle(2).idle_timeout(Some(Duration::ZERO)));
+        let p = pool(|b| b.max_size(4).idle_timeout(Some(Duration::ZERO)));
+        let a = p.get().unwrap();
+        let b = p.get().unwrap();
+        drop((a, b));
         assert_eq!(p.status().idle, 2);
         p.0.reap();
         assert_eq!(p.status().idle, 0);
         assert_eq!(p.status().size, 0);
+    }
+
+    #[test]
+    fn test_reap_refills_to_min_idle() {
+        // Every idle resource is expired at once, so the pass prunes both and
+        // then creates two fresh ones to restore the floor.
+        let p = pool(|b| b.max_size(4).min_idle(2).idle_timeout(Some(Duration::ZERO)));
+        assert_eq!(p.0.manager.created.load(Ordering::SeqCst), 2);
+        p.0.reap();
+        assert_eq!(p.status().idle, 2);
+        assert_eq!(p.status().size, 2);
+        assert_eq!(p.0.manager.created.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn test_reap_refill_respects_max_size() {
+        let p = pool(|b| b.max_size(2).min_idle(2));
+        let a = p.get().unwrap();
+        let b = p.get().unwrap();
+        p.0.reap(); // both slots are checked out, so there is no room to refill
+        assert_eq!(p.status().size, 2);
+        assert_eq!(p.0.manager.created.load(Ordering::SeqCst), 2);
+        drop((a, b));
+    }
+
+    #[test]
+    fn test_reap_refill_stops_on_create_error() {
+        let p = pool(|b| b.max_size(4).min_idle(2).idle_timeout(Some(Duration::ZERO)));
+        p.0.manager.create_fails.store(true, Ordering::SeqCst);
+        p.0.reap();
+        let status = p.status();
+        assert_eq!(status.idle, 0);
+        assert_eq!(status.size, 0); // the reserved slots were all given back
+    }
+
+    /// Spin until `n` threads are queued in `reserve`.
+    fn wait_for_queue(p: &Pool<Steerable>, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while lock(&p.0.state).queue.len() < n {
+            assert!(Instant::now() < deadline, "waiters never queued");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn test_waiters_are_served_in_arrival_order() {
+        let p = pool(|b| b.max_size(1).create_timeout(None));
+        let held = p.get().unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for id in 0..3 {
+            let (p2, order2) = (p.clone(), Arc::clone(&order));
+            handles.push(thread::spawn(move || {
+                let guard = p2.get().unwrap();
+                lock(&order2).push(id);
+                thread::sleep(Duration::from_millis(5));
+                drop(guard);
+            }));
+            wait_for_queue(&p, id + 1);
+        }
+        drop(held);
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(*lock(&order), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_newcomer_does_not_take_a_resource_ahead_of_a_starved_waiter() {
+        let p = pool(|b| b.max_size(1).create_timeout(None));
+        let held = p.get().unwrap();
+        let p2 = p.clone();
+        let waiter = thread::spawn(move || drop(p2.get().unwrap()));
+        wait_for_queue(&p, 1);
+        thread::sleep(STARVATION_LIMIT * 5);
+        // The resource goes back while a thread has waited past the starvation
+        // limit. A newcomer that asks right away must not take it first.
+        drop(held);
+        assert!(matches!(p.try_get(), Err(Error::Timeout)));
+        waiter.join().unwrap();
+        assert!(p.try_get().is_ok());
+    }
+
+    #[test]
+    fn test_timed_out_head_passes_the_turn_on() {
+        let p = pool(|b| b.max_size(1).create_timeout(None));
+        let held = p.get().unwrap();
+        let p2 = p.clone();
+        let short = thread::spawn(move || p2.get_timeout(Duration::from_millis(50)).is_err());
+        wait_for_queue(&p, 1);
+        let p3 = p.clone();
+        let long = thread::spawn(move || drop(p3.get().unwrap()));
+        wait_for_queue(&p, 2);
+        assert!(short.join().unwrap(), "the first waiter times out");
+        drop(held);
+        long.join().unwrap(); // the second waiter is still served
+        assert_eq!(lock(&p.0.state).queue.len(), 0);
+    }
+
+    #[test]
+    fn test_close_wakes_every_waiter() {
+        let p = pool(|b| b.max_size(1).create_timeout(None));
+        let _held = p.get().unwrap();
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let p2 = p.clone();
+                thread::spawn(move || matches!(p2.get(), Err(Error::Closed)))
+            })
+            .collect();
+        wait_for_queue(&p, 3);
+        p.close();
+        for handle in handles {
+            assert!(handle.join().unwrap());
+        }
+        assert_eq!(lock(&p.0.state).queue.len(), 0);
+    }
+
+    #[test]
+    fn test_checkout_is_lifo() {
+        let p = pool(|b| b.max_size(4).min_idle(4));
+        // The most recently returned resource is handed out first.
+        let first = *p.get().unwrap();
+        let again = *p.get().unwrap();
+        assert_eq!(first, again);
     }
 
     #[test]

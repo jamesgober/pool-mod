@@ -33,12 +33,21 @@ pub struct PoolConfig {
     /// plus checked out. Must be at least 1.
     pub max_size: usize,
 
-    /// Number of resources to create up front when the pool is built, and the
-    /// floor the pool keeps ready. Must not exceed `max_size`.
+    /// Number of idle resources to create up front when the pool is built. When
+    /// `reap_interval` is set, the reaper also refills the idle set to this
+    /// floor on each pass; without it, the idle set is refilled only on demand.
+    /// Must not exceed `max_size`.
     pub min_idle: usize,
 
-    /// How long [`Pool::get`](crate::Pool::get) waits for a resource when the
-    /// pool is saturated. `None` waits indefinitely.
+    /// How long [`Pool::get`](crate::Pool::get) waits for a free resource or
+    /// slot when the pool is saturated. `None` waits indefinitely, as does a
+    /// value too large to add to the current time.
+    ///
+    /// Despite the name, this bounds waiting only: it does not interrupt a
+    /// [`Manager::create`](crate::Manager::create) that has started. The
+    /// deadline is passed to
+    /// [`Manager::create_with_deadline`](crate::Manager::create_with_deadline)
+    /// so a manager can bound its own connect time.
     pub create_timeout: Option<Duration>,
 
     /// Discard and replace an idle resource that has gone unused for at least
@@ -52,11 +61,14 @@ pub struct PoolConfig {
 
     /// How often a background thread should prune idle resources that have
     /// outlived `idle_timeout` or `max_lifetime`, rather than waiting for them to
-    /// be rejected on their next checkout. `None` (the default) runs no
-    /// background thread; expiry is then applied lazily, on borrow.
+    /// be rejected on their next checkout, and refill the idle set to
+    /// `min_idle`. `None` (the default) runs no background thread; expiry is
+    /// then applied lazily, on borrow, and the idle set is refilled only on
+    /// demand.
     ///
-    /// The reaper only prunes — it never creates resources — and has no effect
-    /// unless `idle_timeout` or `max_lifetime` is also set.
+    /// The refill runs [`Manager::create`](crate::Manager::create) on the
+    /// reaper thread and never grows the pool past `max_size`. A failed or
+    /// panicking `create` ends that pass; the next pass tries again.
     pub reap_interval: Option<Duration>,
 }
 

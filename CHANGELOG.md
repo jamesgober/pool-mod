@@ -9,13 +9,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.1.0] - 2026-11-12
+
+Fixes from an independent review. No breaking API change and no MSRV change.
+Some runtime behavior changes; each one is listed under Changed.
+
 ### Added
+
+- `Pool::try_get_idle`: hand out an idle resource or return `Error::Timeout` at
+  once. It never calls `create`, so it never waits on a backend connect.
+- `Manager::create_with_deadline(&self, Option<Instant>)`, a provided method
+  that defaults to `create()`. The pool now always creates through it and passes
+  the caller's deadline, so a manager can bound its own connect time.
+- `Pooled::discard(guard)` drops a resource known to be broken instead of
+  returning it to the pool. `Pooled::detach(guard)` takes the resource out of
+  the pool for good. Both free the slot. They are associated functions, so they
+  cannot shadow a method of the resource.
 
 ### Changed
 
+- With `reap_interval` set, the reaper now refills the idle set to `min_idle` on
+  each pass (never past `max_size`). Before, `min_idle` resources were created
+  once at build time and never replaced, although the docs said the pool kept
+  them ready.
+- Idle resources are reused last in, first out. The most recently returned
+  resource is handed out first, so under light load the surplus resources reach
+  `idle_timeout` and expire, as configured. Before, checkout rotated through
+  every idle resource and kept all of them warm.
+- Waiting threads are served in arrival order, and a returned resource is
+  offered to the one that has waited longest. A newly arriving thread may still
+  take a free resource first, but only while the oldest waiter has waited less
+  than about a millisecond; after that, newcomers queue behind the waiters.
+  Before, a newcomer could take a returned resource ahead of a waiter for as
+  long as the pool stayed saturated, so an early waiter could time out while
+  later arrivals succeeded. (A strict hand-off to the oldest waiter was measured
+  and cut saturated throughput by more than ten times, so newcomers keep the
+  short head start.)
+- A guard dropped while its thread is panicking is discarded without calling
+  `recycle`, since the resource may have been left half way through an
+  operation, and a second panic during unwinding would abort the process.
+- Docs: the timeouts bound the wait for a free slot, not `create` or `validate`
+  once started; `try_get` never waits for another thread but may run `create`;
+  `mem::forget` on a guard keeps its slot taken; `Error::Backend` carries the
+  manager's error unchanged into `Display`.
+- Checkout skips reading the clock when neither `idle_timeout` nor
+  `max_lifetime` is set.
+
 ### Fixed
 
-### Security
+- A panic in `create`, `validate` or `recycle` leaked the slot reserved for the
+  resource. After `max_size` such panics, every `get` returned `Timeout` for the
+  life of the pool. Each hook now runs under a guard that gives the slot back on
+  unwind.
+- `get_timeout(Duration::MAX)`, and `get` with `create_timeout` set to
+  `Duration::MAX`, panicked on `Instant` overflow. A timeout too large to
+  represent now waits indefinitely.
+- A panicking `create` during the reaper's refill no longer ends the reaper
+  thread.
 
 ---
 
@@ -152,7 +204,8 @@ background reaper — lands here; the rest is audit and verification.
 - Stripped the UTF-8 BOM and added trailing newlines to the source files to
   satisfy `rustfmt`.
 
-[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/pool-mod/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/pool-mod/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/pool-mod/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/jamesgober/pool-mod/compare/v0.5.0...v0.9.0
 [0.5.0]: https://github.com/jamesgober/pool-mod/compare/v0.2.0...v0.5.0

@@ -36,6 +36,7 @@ The whole pooling surface lives behind the default `std` feature. With
     - [`Pool::get`](#poolget)
     - [`Pool::get_timeout`](#poolget_timeout)
     - [`Pool::try_get`](#pooltry_get)
+    - [`Pool::try_get_idle`](#pooltry_get_idle)
     - [`Pool::status`](#poolstatus)
     - [`Pool::close`](#poolclose)
     - [`Pool::is_closed`](#poolis_closed)
@@ -58,7 +59,7 @@ The whole pooling surface lives behind the default `std` feature. With
 
 ```toml
 [dependencies]
-pool-mod = "1.0"
+pool-mod = "1.1"
 ```
 
 The crate is edition 2021 with a Minimum Supported Rust Version of 1.75, and
@@ -115,6 +116,8 @@ pub trait Manager: Send + Sync + 'static {
     fn create(&self) -> Result<Self::Resource, Self::Error>;
     fn recycle(&self, resource: &mut Self::Resource) -> Result<(), Self::Error>;
     fn validate(&self, resource: &mut Self::Resource) -> bool { /* default: true */ }
+    fn create_with_deadline(&self, deadline: Option<Instant>)
+        -> Result<Self::Resource, Self::Error> { /* default: self.create() */ }
 }
 ```
 
@@ -139,11 +142,26 @@ returning resources.
 | `create`   | `fn create(&self) -> Result<Resource, Error>`          | the pool needs to grow toward `max_size`     |
 | `recycle`  | `fn recycle(&self, &mut Resource) -> Result<(), Error>`| a borrowed resource is returned              |
 | `validate` | `fn validate(&self, &mut Resource) -> bool`            | an idle resource is checked out (default `true`) |
+| `create_with_deadline` | `fn create_with_deadline(&self, Option<Instant>) -> Result<Resource, Error>` | every time the pool creates a resource (default calls `create`) |
 
 `create` errors surface to the caller as [`Error::Backend`](#error) and the
 reserved slot is released. `recycle` errors cause the resource to be discarded
 (not pooled) and its slot freed. `validate` returning `false` discards the
 resource and the pool tries the next idle one, or creates a fresh resource.
+
+If any hook panics, the pool releases the slot it had reserved and drops the
+resource; the panic still reaches the caller. `recycle` is not called for a
+guard dropped while its thread is panicking: that resource is discarded.
+
+The pool's timeouts bound only the wait for a free slot. They cannot interrupt a
+`create` that has started. The pool passes the caller's deadline to
+`create_with_deadline` (`None` when there is none: no timeout, `min_idle`
+creation at build time, or the reaper's refill; the moment of the call for
+`try_get`), so a manager can bound its own connect time by overriding it.
+
+`Error::Backend` carries the manager's error unchanged, so whatever the error
+holds (a connection string, say) reaches logs through `Display`. Keep secrets
+out of the manager's error type.
 
 **Examples**
 
@@ -284,9 +302,17 @@ pub fn get(&self) -> Result<Pooled<M>, Error<M::Error>>
 
 Borrow a resource, waiting up to the configured
 [`create_timeout`](#poolconfig) if the pool is saturated. Reuses a validated idle
-resource when one is available, grows the pool toward `max_size` when none is,
-and otherwise blocks until a resource is returned or the timeout elapses. Returns
-a [`Pooled`](#pooled) guard that returns the resource to the pool on drop.
+resource when one is available (most recently returned first), grows the pool
+toward `max_size` when none is, and otherwise blocks until a resource is returned
+or the timeout elapses. Threads that have to wait are served in arrival order. A
+newly arriving thread that finds a resource free may take it ahead of the
+waiters, but only while the oldest waiter has waited less than about a
+millisecond; after that, newcomers queue behind the waiters.
+Returns a [`Pooled`](#pooled) guard that returns the resource to the pool on drop.
+
+The timeout bounds the wait for a free resource or slot, not a `validate` or
+`create` call that has started (see [`Manager`](#manager)). A timeout too large
+to add to the current time, such as `Duration::MAX`, waits indefinitely.
 
 **Errors:**
 
@@ -314,12 +340,13 @@ assert_eq!(*resource, 7);
 pub fn get_timeout(&self, timeout: Duration) -> Result<Pooled<M>, Error<M::Error>>
 ```
 
-Borrow a resource, waiting at most `timeout` regardless of the configured
-`create_timeout`.
+Borrow a resource, waiting at most `timeout` for a free resource or slot,
+regardless of the configured `create_timeout`.
 
-- `timeout` — the maximum time to wait. [`Duration::ZERO`] makes a non-blocking
-  try that returns [`Error::Timeout`](#error) immediately if no resource can be
-  handed out at once.
+- `timeout`: the maximum time to wait. [`Duration::ZERO`] never waits for another
+  thread and returns [`Error::Timeout`](#error) immediately if no resource can be
+  handed out at once. As with `get`, it does not bound a `create` that has
+  started, and `Duration::MAX` waits indefinitely.
 
 **Errors:** identical to [`Pool::get`](#poolget), with the timeout taken from the
 argument.
@@ -346,10 +373,14 @@ assert!(matches!(pool.get_timeout(Duration::ZERO), Err(Error::Timeout)));
 pub fn try_get(&self) -> Result<Pooled<M>, Error<M::Error>>
 ```
 
-Borrow a resource without ever blocking. Returns a resource if one can be handed
-out immediately — an idle resource is ready, or the pool has room to create one —
-and otherwise returns [`Error::Timeout`](#error) at once. Equivalent to
-[`get_timeout(Duration::ZERO)`](#poolget_timeout).
+Borrow a resource without waiting for another thread to return one. Returns a
+resource if one can be handed out immediately (an idle resource is ready, or the
+pool has room to create one) and otherwise returns [`Error::Timeout`](#error) at
+once. Equivalent to [`get_timeout(Duration::ZERO)`](#poolget_timeout).
+
+When the pool has room, this runs `create` on the calling thread, which takes as
+long as the manager takes. To never run `create`, use
+[`try_get_idle`](#pooltry_get_idle).
 
 **Errors:** identical to [`Pool::get`](#poolget); `Timeout` is returned the
 instant no resource is available rather than after a wait.
@@ -367,6 +398,36 @@ let pool = Pool::builder(M).max_size(1).build().expect("valid");
 let first = pool.try_get().expect("room to create one");
 // The only slot is taken, so the next try fails immediately.
 assert!(matches!(pool.try_get(), Err(Error::Timeout)));
+```
+
+#### `Pool::try_get_idle`
+
+```rust
+pub fn try_get_idle(&self) -> Result<Pooled<M>, Error<M::Error>>
+```
+
+Borrow an idle resource without waiting and without creating one. Returns an
+idle resource (after the usual expiry and `validate` checks) if one is ready and
+no other thread is already waiting, and otherwise returns
+[`Error::Timeout`](#error) at once. It never calls `create`, so it never waits on
+a backend connect. Added in 1.1.0.
+
+**Errors:** `Timeout` if no idle resource is ready; `Closed` if the pool has been
+closed.
+
+```rust
+use pool_mod::{Error, Manager, Pool};
+# use std::convert::Infallible;
+# struct M;
+# impl Manager for M {
+#   type Resource = u32; type Error = Infallible;
+#   fn create(&self) -> Result<u32, Infallible> { Ok(0) }
+#   fn recycle(&self, _r: &mut u32) -> Result<(), Infallible> { Ok(()) }
+# }
+let pool = Pool::builder(M).max_size(2).build().expect("valid");
+assert!(matches!(pool.try_get_idle(), Err(Error::Timeout))); // nothing idle yet
+drop(pool.get().expect("room to create one"));
+assert!(pool.try_get_idle().is_ok());
 ```
 
 #### `Pool::status`
@@ -459,11 +520,11 @@ a field of [`PoolConfig`](#poolconfig).
 | Setter            | Argument           | Effect                                          |
 |-------------------|--------------------|-------------------------------------------------|
 | `max_size`        | `usize`            | Upper bound on owned resources.                 |
-| `min_idle`        | `usize`            | Resources created up front and kept ready.      |
-| `create_timeout`  | `Option<Duration>` | `get` wait bound; `None` waits forever.         |
+| `min_idle`        | `usize`            | Idle resources created up front; the reaper refills to it. |
+| `create_timeout`  | `Option<Duration>` | `get` wait bound for a slot; `None` waits forever. Does not bound `create`. |
 | `idle_timeout`    | `Option<Duration>` | Idle-expiry window; `None` disables it.         |
 | `max_lifetime`    | `Option<Duration>` | Lifetime cap; `None` disables it.               |
-| `reap_interval`   | `Option<Duration>` | Background prune cadence; `None` disables the reaper. |
+| `reap_interval`   | `Option<Duration>` | Background prune and refill cadence; `None` disables the reaper. |
 | `config`          | `PoolConfig`       | Replace the whole configuration at once.        |
 
 `build` validates the configuration and pre-creates the `min_idle` resources:
@@ -543,21 +604,27 @@ construction.
 | Field            | Default | Meaning                                                          |
 |------------------|---------|------------------------------------------------------------------|
 | `max_size`       | `10`    | Hard cap on owned resources (idle + checked out). Must be ≥ 1.   |
-| `min_idle`       | `0`     | Resources created up front and kept ready. Must be ≤ `max_size`. |
-| `create_timeout` | `30s`   | `get` wait bound when saturated. `None` waits indefinitely.      |
+| `min_idle`       | `0`     | Idle resources created up front; the reaper refills to it. Must be ≤ `max_size`. |
+| `create_timeout` | `30s`   | `get` wait bound for a slot when saturated. `None` waits indefinitely. Does not bound `create`. |
 | `idle_timeout`   | `None`  | Replace a resource unused this long, checked on next borrow.     |
 | `max_lifetime`   | `None`  | Replace a resource older than this, checked on next borrow.      |
-| `reap_interval`  | `None`  | Background prune cadence; `None` applies expiry lazily on borrow. |
+| `reap_interval`  | `None`  | Background prune and refill cadence; `None` applies expiry lazily on borrow. |
 
 `PoolConfig::default()` returns the values in the table above.
 
 When `reap_interval` is `Some`, the pool spawns a background thread that prunes
 idle resources past `idle_timeout` / `max_lifetime` on that cadence, instead of
-waiting for them to be rejected at their next checkout. The reaper only prunes —
-it never creates resources — and has no effect unless `idle_timeout` or
-`max_lifetime` is also set. It holds a weak reference to the pool and stops when
-the pool is closed or its last handle is dropped. If the OS cannot spawn the
-thread, the pool falls back to lazy, checkout-time expiry.
+waiting for them to be rejected at their next checkout. On each pass it then
+creates resources until the idle set is back at `min_idle`, never growing the
+pool past `max_size`; a failed or panicking `create` ends that pass and the next
+pass tries again. Without a reaper, the idle set is refilled only on demand. The
+reaper holds a weak reference to the pool and stops when the pool is closed or
+its last handle is dropped. If the OS cannot spawn the thread, the pool falls
+back to lazy, checkout-time expiry.
+
+`PoolConfig` is not `#[non_exhaustive]`, so a struct literal that names every
+field breaks if a field is added. Write configurations with
+`..PoolConfig::default()`, as in the example below.
 
 **Examples**
 
@@ -601,18 +668,35 @@ pub struct Pooled<M: Manager> { /* private */ }
 impl<M: Manager> Deref for Pooled<M> { type Target = M::Resource; }
 impl<M: Manager> DerefMut for Pooled<M> { }
 impl<M: Manager> Drop for Pooled<M> { }
+
+impl<M: Manager> Pooled<M> {
+    pub fn detach(this: Self) -> M::Resource;
+    pub fn discard(this: Self);
+}
 ```
 
 The RAII guard returned by [`Pool::get`](#poolget) and
 [`Pool::get_timeout`](#poolget_timeout). It deref-coerces to the underlying
 resource, so it can be used anywhere a `&M::Resource` or `&mut M::Resource` is
 expected. When the guard is dropped, the resource is recycled (via
-[`Manager::recycle`](#manager)) and returned to the idle set — there is no
-`release` call to remember, and forgetting a guard cannot leak a resource.
+[`Manager::recycle`](#manager)) and returned to the idle set, so there is no
+`release` call to remember. Passing the guard to `std::mem::forget` skips the
+destructor and keeps its slot taken for the life of the pool.
 
-If recycling fails, or the pool has been closed, the resource is dropped instead
-of pooled and its slot is freed. The guard is `Send` whenever the resource is, so
-it may be held across `.await` points.
+If recycling fails or panics, the guard is dropped while its thread is
+panicking, or the pool has been closed, the resource is dropped instead of pooled
+and its slot is freed. The guard is `Send` whenever the resource is, so it may be
+held across `.await` points.
+
+Two associated functions (added in 1.1.0) take a resource out of the pool on
+purpose. Both free the slot so the pool can create a replacement, and neither
+calls `recycle`. They are written `Pooled::detach(guard)` rather than
+`guard.detach()` so they never shadow a method of the resource.
+
+- `Pooled::discard(guard)` drops the resource, for example after an I/O error
+  shows the connection is broken.
+- `Pooled::detach(guard)` returns the resource to the caller, who owns it from
+  then on.
 
 **Examples**
 
