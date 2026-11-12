@@ -49,7 +49,7 @@
 //!     }
 //! }
 //!
-//! // A pool of at most eight widgets, two kept ready at all times.
+//! // A pool of at most eight widgets, two of them created up front.
 //! let pool = Pool::builder(Widgets)
 //!     .max_size(8)
 //!     .min_idle(2)

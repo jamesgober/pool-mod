@@ -33,11 +33,13 @@
 ## Features
 
 - **Generic over any resource** — pool connections, clients, threads, buffers, or anything else through one [`Manager`](./docs/API.md#manager) trait.
-- **Min / max sizing** — `min_idle` resources are created up front and kept ready; the pool grows on demand up to `max_size` and never beyond it.
-- **Blocking acquisition with timeouts** — [`get`](./docs/API.md#poolget) waits up to a configured `create_timeout`; [`get_timeout`](./docs/API.md#poolget_timeout) overrides it per call, and [`try_get`](./docs/API.md#pooltry_get) never blocks.
+- **Min / max sizing**: `min_idle` resources are created up front, and the background reaper (when enabled) refills the idle set to that floor; the pool grows on demand up to `max_size` and never beyond it.
+- **Blocking acquisition with timeouts**: [`get`](./docs/API.md#poolget) waits up to a configured `create_timeout` for a free resource or slot; [`get_timeout`](./docs/API.md#poolget_timeout) overrides it per call, and [`try_get`](./docs/API.md#pooltry_get) never waits for another thread. The timeouts bound waiting, not `create`: a manager can bound its own connect time through `create_with_deadline`, and [`try_get_idle`](./docs/API.md#pooltry_get_idle) never creates at all.
+- **Bounded waiting**: threads that have to wait are served in arrival order, and once the oldest waiter has waited about a millisecond, newly arriving threads queue behind it instead of taking resources first.
 - **Validation-on-borrow** — an optional `validate` hook (a health-check callback) runs on checkout; a resource that fails is discarded and replaced transparently.
 - **Idle & max-lifetime expiry** — stale resources are dropped and replaced, bounded by `idle_timeout` and `max_lifetime`. Applied lazily on checkout by default, or eagerly by an opt-in background reaper (`reap_interval`).
-- **RAII return** — the [`Pooled`](./docs/API.md#pooled) guard recycles and returns its resource automatically on drop. There is no `release` to forget and no way to leak a resource.
+- **RAII return**: the [`Pooled`](./docs/API.md#pooled) guard recycles and returns its resource automatically on drop, so there is no `release` to forget. `Pooled::discard` and `Pooled::detach` take a resource out of the pool on purpose.
+- **Panic-safe hooks**: if `create`, `validate` or `recycle` panics, the pool frees the slot it had reserved, so a panicking backend cannot shrink the pool.
 - **Thread-safe and cheap to share** — [`Pool`](./docs/API.md#pool) is `Send + Sync` and clones into another handle onto the same pool.
 - **Runtime-agnostic, zero-dependency** — no async runtime, no third-party crates.
 - **`no_std`-aware** — the crate root compiles without `std`; the pool itself is behind the default `std` feature.
@@ -50,7 +52,7 @@
 
 ```toml
 [dependencies]
-pool-mod = "1.0"
+pool-mod = "1.1"
 ```
 
 MSRV is Rust 1.75. The crate is edition 2021 and builds on Linux, macOS, and Windows.
@@ -106,7 +108,7 @@ A pool owns up to `max_size` resources. Each checkout:
 2. **Creates** a new resource if none is idle and the pool has not reached `max_size`.
 3. **Waits** if the pool is saturated, until a resource is returned or the timeout elapses.
 
-When a [`Pooled`](./docs/API.md#pooled) guard is dropped, its resource is passed to `recycle` and returned to the idle set. If recycling fails — or the pool has been closed — the resource is dropped instead and its slot is freed for a replacement.
+When a [`Pooled`](./docs/API.md#pooled) guard is dropped, its resource is passed to `recycle` and returned to the idle set. If recycling fails or panics, the guard is dropped while its thread is panicking, or the pool has been closed, the resource is dropped instead and its slot is freed for a replacement. Idle resources are reused most recently returned first, so under light load the surplus ones reach `idle_timeout` and expire.
 
 Resource construction, validation, and recycling all run **without the pool's internal lock held**, so a slow `create` (opening a socket, say) never blocks other threads from returning resources. The lock guards only a small queue and a couple of counters.
 
@@ -119,11 +121,11 @@ Configure through the [`Builder`](./docs/API.md#builder), or build a [`PoolConfi
 | Setting          | Default | Meaning                                                            |
 |------------------|---------|--------------------------------------------------------------------|
 | `max_size`       | `10`    | Upper bound on resources owned at once (idle + checked out).       |
-| `min_idle`       | `0`     | Resources created up front and kept ready. Must be ≤ `max_size`.   |
-| `create_timeout` | `30s`   | How long `get` waits when saturated. `None` waits indefinitely.    |
+| `min_idle`       | `0`     | Idle resources created up front, refilled by the reaper. Must be ≤ `max_size`. |
+| `create_timeout` | `30s`   | How long `get` waits for a slot when saturated. `None` waits indefinitely. Does not bound `create`. |
 | `idle_timeout`   | `None`  | Replace a resource unused for this long, checked on next borrow.   |
 | `max_lifetime`   | `None`  | Replace a resource older than this, checked on next borrow.        |
-| `reap_interval`  | `None`  | Background prune cadence. `None` applies expiry lazily on borrow.  |
+| `reap_interval`  | `None`  | Background prune and `min_idle` refill cadence. `None` applies expiry lazily on borrow. |
 
 ```rust
 use std::time::Duration;
@@ -169,13 +171,13 @@ A native non-blocking async acquisition API is on the roadmap (see below).
 
 For the complete reference — every public item, its parameters, return values, error semantics, and runnable examples — see [`docs/API.md`](./docs/API.md).
 
-- [`Manager`](./docs/API.md#manager) — the trait you implement: `create`, `recycle`, and the optional `validate` health check.
-- [`Pool`](./docs/API.md#pool) — `builder` / `new`, `get` / `get_timeout` / `try_get`, `status`, `close`, `is_closed`.
-- [`Builder`](./docs/API.md#builder) — fluent configuration.
-- [`PoolConfig`](./docs/API.md#poolconfig) — limits and lifecycle policy.
-- [`Pooled`](./docs/API.md#pooled) — the RAII guard, deref-coercing to your resource.
-- [`Status`](./docs/API.md#status) — `size`, `idle`, `in_use`, `max_size`.
-- [`Error`](./docs/API.md#error) — `Backend`, `Timeout`, `Closed`, `InvalidConfig`.
+- [`Manager`](./docs/API.md#manager): the trait you implement, with `create`, `recycle`, and the optional `validate` health check and `create_with_deadline`.
+- [`Pool`](./docs/API.md#pool): `builder` / `new`, `get` / `get_timeout` / `try_get` / `try_get_idle`, `status`, `close`, `is_closed`.
+- [`Builder`](./docs/API.md#builder): fluent configuration.
+- [`PoolConfig`](./docs/API.md#poolconfig): limits and lifecycle policy.
+- [`Pooled`](./docs/API.md#pooled): the RAII guard, deref-coercing to your resource; `Pooled::detach` and `Pooled::discard`.
+- [`Status`](./docs/API.md#status): `size`, `idle`, `in_use`, `max_size`.
+- [`Error`](./docs/API.md#error): `Backend`, `Timeout`, `Closed`, `InvalidConfig`.
 
 <br>
 
